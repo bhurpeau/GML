@@ -1,0 +1,7 @@
+[project]
+name = "GML_GD"
+version = "0.1.0"
+description = "Graph Machine Learning on Geographic Data"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = []
