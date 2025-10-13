@@ -79,16 +79,19 @@ def perform_semantic_sjoin(gdf_parcelles, gdf_usage_sol):
                 )
     # Retourner les features enrichies (la colonne PLU_LIBELLE est ajoutée)
     return final_features
-    
+
 def load_and_prepare_real_data():
     """
     Charge les fichiers réels, prépare les features (normalisation + PLU), 
-    et crée les arêtes par jointure spatiale (sjoin_nearest et intersects).
+    et crée les arêtes par jointure spatiale.
+    Cette version inclut les arêtes inverses ('bâtiment' -> 'adresse') pour
+    permettre la propagation des messages dans les deux sens.
     """
     print("--- 1. Chargement et Préparation des Données Réelles ---")
 
     # 1.1 Chargement des fichiers
-    df_adr =  pd.read_csv('data/adresses-92.csv', delimiter=';')
+    # (Le code de chargement et de préparation initiale reste identique)
+    df_adr = pd.read_csv('data/adresses-92.csv', delimiter=';', low_memory=False)
     gdf_adr = gpd.GeoDataFrame(
         df_adr, 
         geometry=gpd.points_from_xy(df_adr['lon'], df_adr['lat']), 
@@ -96,9 +99,9 @@ def load_and_prepare_real_data():
     )
     gdf_bat = gpd.read_file('data/BDT_3-5_GPKG_LAMB93_D092-ED2025-06-15.gpkg', layer='batiment')
     gdf_par = gpd.read_file('data/cadastre-92-parcelles.json')
-
     
     # 1.2 Normalisation des CRS (Lambert 93)
+    TARGET_CRS = "EPSG:2154" # Assurez-vous que cette constante est définie
     gdf_adr = gdf_adr.to_crs(TARGET_CRS)
     gdf_bat = gdf_bat.to_crs(TARGET_CRS)
     gdf_par = gdf_par.to_crs(TARGET_CRS)
@@ -107,102 +110,85 @@ def load_and_prepare_real_data():
     gdf_adr = gdf_adr.rename(columns={'id': 'id_adr'}).assign(id_adr=lambda x: x['id_adr'].astype(str))
     
     # Bâtiments : Créer ID et features numériques (hauteur/surface)
-    gdf_bat = gdf_bat.reset_index().rename(columns={'cleabs': 'id_bat_idx'}).assign(
+    gdf_bat = gdf_bat.reset_index().rename(columns={'index': 'id_bat_idx'}).assign(
         id_bat=lambda x: 'BAT_' + x['id_bat_idx'].astype(str),
-        # Utiliser l'aire réelle comme proxy de surface
-        surface=lambda x: x.force_2d().area
+        surface=lambda x: x.geometry.area
     ).drop(columns=['id_bat_idx'])
     
     # Parcelles : Forcer la superficie à être numérique et gérer les ID
-    gdf_par = gdf_par.rename(columns={'id': 'id_par', 'superficie': 'superficie'}).assign(
+    gdf_par = gdf_par.rename(columns={'id': 'id_par'}).assign(
         id_par=lambda x: x['id_par'].astype(str),
-        superficie=lambda x: pd.to_numeric(x.geometry.area, errors='coerce').fillna(0.0).astype(np.float32)
+        superficie=lambda x: pd.to_numeric(x.geometry.area, errors='coerce').fillna(0.0)
     )
 
     gdf_par = gdf_par[['id_par','superficie','geometry']].copy()
     gdf_bat = gdf_bat[['id_bat','surface','hauteur','geometry']].copy()
-    gdf_adr = gdf_adr[['id_adr','x','y','geometry']].copy()
-    # --- 1.3. Encodage des Features Sémantiques (PLU) & Normalisation ---
+    gdf_adr = gdf_adr.assign(x=lambda df: df.geometry.x, y=lambda df: df.geometry.y)[['id_adr','x','y','geometry']].copy()
+
+    # 1.3. Encodage PLU & Normalisation
+    # (Le code d'encodage et de normalisation reste identique)
     doc_urba = gpd.read_file("data/wfs_du.gpkg",layer='zone_urba')
-    doc_urba = doc_urba[['gid','partition','libelle','typezone','geometry']].copy()
-    doc_urba = doc_urba.set_crs(4326, allow_override=True)
+    doc_urba = doc_urba.to_crs(TARGET_CRS)
     gdf_par = perform_semantic_sjoin(gdf_par, doc_urba)
-    
-    # Imputation des NaN PLU (Valeurs manquantes = 'HORS_PLU' pour le GNN)
     gdf_par['LIBELLE'] = gdf_par['LIBELLE'].fillna('HORS_PLU')
     gdf_par['TYPEZONE'] = gdf_par['TYPEZONE'].fillna('HORS_PLU')
-    
-    # Encodage One-Hot des labels (features sémantiques)
     df_plu_encoded = pd.get_dummies(gdf_par[['LIBELLE', 'TYPEZONE']], prefix=['PLU_LIBELLE', 'TYPEZONE'])
 
-    # APPLICATION DE LA NORMALISATION Min-Max (Critique pour la performance)
-    gdf_adr['x'] = gdf_adr.geometry.x
-    gdf_adr['y'] = gdf_adr.geometry.y
-    
     gdf_adr = normalize_features(gdf_adr, ['x', 'y']) 
     gdf_bat = normalize_features(gdf_bat, ['hauteur', 'surface'])
     gdf_par = normalize_features(gdf_par, ['superficie'])
     
-    # Préparation des tenseurs de features NORMALISÉS
     par_features_base = gdf_par[['superficie']].values
     par_features = np.hstack([par_features_base, df_plu_encoded.values])
     
-    # --- 1.4. Création des Relations (Arêtes) ---
-    
-    # A) Relation Bâtiment -> Parcelle (Lien pondéré)
+    # 1.4. Création des Relations (Arêtes)
     sjoin_bp_id = gpd.sjoin(gdf_bat[['id_bat', 'geometry']], gdf_par[['id_par', 'geometry']], how='left', predicate='intersects', lsuffix='bat', rsuffix='par')
     edge_index_bp_df = sjoin_bp_id[['id_bat', 'id_par']].dropna().reset_index(drop=True)
-    
-    # Poids de l'arête B->P : SIMULATION (1.0) en attendant le calcul réel d'intersection
     edge_index_bp_df['intersection_perc'] = 1.0 
     
-    # B) Relation Adresse -> Bâtiment (Jointure de Proximité)
     print("Calcul de la relation Adresse -> Bâtiment (sjoin_nearest)...")
-    
-    # Utilisation de sjoin_nearest pour gérer les adresses sur la voie publique (max 100m)
     MAX_DISTANCE_METERS = 100 
     sjoin_ab = gpd.sjoin_nearest(
         gdf_adr, 
         gdf_bat[['id_bat', 'geometry']], 
         how='left', 
         max_distance=MAX_DISTANCE_METERS, 
-        lsuffix='adr', 
-        rsuffix='bat'
     )
     edge_index_ab_df = sjoin_ab[['id_adr', 'id_bat']].dropna().reset_index(drop=True)
 
-    # --- 1.5. Conversion Finale pour PyTorch ---
-    
-    # Création des Mappings ID réel -> Index numérique
+    # 1.5. Conversion Finale pour PyTorch
     adr_map = {id: i for i, id in enumerate(gdf_adr['id_adr'].unique())}
     bat_map = {id: i for i, id in enumerate(gdf_bat['id_bat'].unique())}
     par_map = {id: i for i, id in enumerate(gdf_par['id_par'].unique())}
     
-    # Conversion des DataFrames d'arêtes en indices numériques
     edge_index_bp_df['bat_src_idx'] = edge_index_bp_df['id_bat'].map(bat_map)
     edge_index_bp_df['par_dst_idx'] = edge_index_bp_df['id_par'].map(par_map)
     edge_index_ab_df['adr_src_idx'] = edge_index_ab_df['id_adr'].map(adr_map)
     edge_index_ab_df['bat_dst_idx'] = edge_index_ab_df['id_bat'].map(bat_map)
+
+    edge_index_bp_df.dropna(subset=['bat_src_idx', 'par_dst_idx'], inplace=True)
+    edge_index_ab_df.dropna(subset=['adr_src_idx', 'bat_dst_idx'], inplace=True)
+
+    edge_index_bp_df = edge_index_bp_df.astype({'bat_src_idx': np.int64, 'par_dst_idx': np.int64})
+    edge_index_ab_df = edge_index_ab_df.astype({'adr_src_idx': np.int64, 'bat_dst_idx': np.int64})
+
+    edge_index_bp = torch.tensor(edge_index_bp_df[['bat_src_idx', 'par_dst_idx']].values.T, dtype=torch.long)
+    edge_index_ab = torch.tensor(edge_index_ab_df[['adr_src_idx', 'bat_dst_idx']].values.T, dtype=torch.long)
     
-    # Tenseurs
-    edge_index_bp = torch.stack([
-        torch.from_numpy(edge_index_bp_df['bat_src_idx'].values), 
-        torch.from_numpy(edge_index_bp_df['par_dst_idx'].values)
-    ], dim=0).to(torch.long)
+    # --- MODIFICATION : Création de la relation inverse ---
+    # ('bâtiment', 'dessert', 'adresse') pour que les nœuds 'adresse' reçoivent des messages.
+    print("Création de la relation inverse Bâtiment -> Adresse...")
+    edge_index_ba = edge_index_ab.flip(0)
+    # --- FIN DE LA MODIFICATION ---
     
-    edge_index_ab = torch.stack([
-        torch.from_numpy(edge_index_ab_df['adr_src_idx'].values), 
-        torch.from_numpy(edge_index_ab_df['bat_dst_idx'].values)
-    ], dim=0).to(torch.long)
+    edge_attr_bp = torch.tensor(edge_index_bp_df['intersection_perc'].values, dtype=torch.float).unsqueeze(1)
     
-    edge_attr_bp = torch.tensor(edge_index_bp_df[['intersection_perc']].values, dtype=torch.float)
-    
-    # Tenseurs de Features (normalisés)
     adr_x = torch.tensor(gdf_adr[['x', 'y']].values.astype(np.float32), dtype=torch.float)
     bat_x = torch.tensor(gdf_bat[['hauteur', 'surface']].values.astype(np.float32), dtype=torch.float)
     par_x = torch.tensor(par_features, dtype=torch.float)
     
-    return adr_x, bat_x, par_x, edge_index_bp, edge_attr_bp, edge_index_ab, bat_map, par_map, adr_map
+    # --- MODIFICATION : Ajout de edge_index_ba dans le retour de la fonction ---
+    return adr_x, bat_x, par_x, edge_index_bp, edge_attr_bp, edge_index_ab, edge_index_ba, bat_map, par_map, adr_map
 
 # --- FONCTION DE CLUSTERING ---
 
