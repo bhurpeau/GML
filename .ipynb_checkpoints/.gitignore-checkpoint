@@ -4,5 +4,5 @@ __pycache__/
 data/
 # Virtual environments
 .venv
-.ipynb_checkpoints
+./.ipynb_checkpoints
 ./**/.ipynb_checkpoints/
