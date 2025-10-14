@@ -27,10 +27,10 @@ def main():
     # la normalisation et la création des tenseurs d'arêtes.
     # Notez que nous récupérons bien l'arête inverse `edge_index_ba`.
     (
-        gdf_bat, adr_x, bat_x, par_x,
-        edge_index_bp, edge_attr_bp,
-        edge_index_ab, edge_index_ba,
-        bat_map, par_map, adr_map
+        gdf_bat, gdf_par, building_parcel_links,
+        adr_x, bat_x, par_x,
+        edge_index_ab, edge_index_ba, edge_index_bp,
+        bat_map
     ) = load_and_prepare_real_data()
 
     # --- Étape 2 : Construction du Graphe Hétérogène ---
@@ -91,25 +91,22 @@ def main():
         print("Vérifiez la cohérence des dimensions dans vos données et le modèle.", file=sys.stderr)
         sys.exit(1) # Arrêter le script en cas d'échec critique
 
-    # --- Étape 4 : Détection de Communautés (Louvain) ---
+    # --- Étape 4 : Détection de Communautés (HDBSCAN + DBSCAN) ---
     if bat_embeddings is not None:
         print("\n--- 4. Détection de Communautés sur les Embeddings ---")
         semantic_communities_df = perform_hdbscan_clustering(bat_embeddings, bat_map)
-        # --- Étape 5 : Post-traitement Géographique (DBSCAN) ---
-        print("\n--- 5. Post-traitement : Sous-clustering Géographique ---")
-      
-        final_communities_df = perform_geographic_subclustering(gdf_bat, semantic_communities_df)
+        # --- Étape 5 : Post-traitement Géographique par Contiguïté Parcellaire ---
+        print("\n--- 5. Post-traitement : Sous-clustering par Contiguïté Parcellaire ---")
+        final_communities_df = perform_geographic_subclustering(gdf_par, building_parcel_links, semantic_communities_df)
         
         # --- Étape 6 : Sauvegarde des Résultats Finaux ---
         num_final_communities = final_communities_df['final_community'].nunique()
-        print(f"Analyse terminée. {num_final_communities} communautés finales (sémantiques + géographiques) identifiées.")
-
+        print(f"\nAnalyse terminée. {num_final_communities} communautés finales (sémantiques + foncières) identifiées.")
+        
         output_path = 'out/final_building_communities.csv'
-        print(f"\n--- 6. Sauvegarde des Résultats ---\nSauvegarde dans le fichier : {output_path}")
+        print(f"Sauvegarde des résultats dans le fichier : {output_path}")
         final_communities_df.to_csv(output_path, index=False)
         print("Résultats sauvegardés.")
-        num_communities = bat_communities_df['community'].nunique()
-        print(f"Détection terminée. {num_communities} communautés de bâtiments identifiées.")
 
 
     print("\n" + " Pipeline terminé avec succès ".center(80, '='))
