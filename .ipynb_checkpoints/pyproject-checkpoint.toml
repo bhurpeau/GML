@@ -4,4 +4,19 @@ version = "0.1.0"
 description = "Graph Machine Learning on Geographic Data"
 readme = "README.md"
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "community>=1.0.0b1",
+    "fiona>=1.10.1",
+    "geopandas>=1.1.1",
+    "hdbscan>=0.8.40",
+    "pandas>=2.3.3",
+    "scikit-learn>=1.7.2",
+    "torch==2.5.0",
+    "torch-geometric>=2.6.1",
+    "hdbscan>=0.8.40",
+]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=6.30.1",
+]

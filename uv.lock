@@ -463,8 +463,10 @@ dependencies = [
     { name = "community" },
     { name = "fiona" },
     { name = "geopandas" },
+    { name = "hdbscan" },
     { name = "pandas" },
     { name = "scikit-learn" },
+    { name = "scipy" },
     { name = "torch" },
     { name = "torch-geometric" },
 ]
@@ -479,14 +481,31 @@ requires-dist = [
     { name = "community", specifier = ">=1.0.0b1" },
     { name = "fiona", specifier = ">=1.10.1" },
     { name = "geopandas", specifier = ">=1.1.1" },
+    { name = "hdbscan", specifier = ">=0.8.40" },
     { name = "pandas", specifier = ">=2.3.3" },
     { name = "scikit-learn", specifier = ">=1.7.2" },
+    { name = "scipy", specifier = ">=1.16.2" },
     { name = "torch", specifier = "==2.5.0" },
     { name = "torch-geometric", specifier = ">=2.6.1" },
 ]
 
 [package.metadata.requires-dev]
 dev = [{ name = "ipykernel", specifier = ">=6.30.1" }]
+
+[[package]]
+name = "hdbscan"
+version = "0.8.40"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "joblib" },
+    { name = "numpy" },
+    { name = "scikit-learn" },
+    { name = "scipy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/c1/84/6b010387b795f774e1ec695df3c8660c15abd041783647d5e7e4076bfc6b/hdbscan-0.8.40.tar.gz", hash = "sha256:c9e383ff17beee0591075ff65d524bda5b5a35dfb01d218245a7ba30c8d48a17", size = 6904096, upload-time = "2024-11-18T16:14:05.384Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/80/2d/ca4d81a5aa5b8ccde1d41b892a2f480c2df238c58f113eee4df50473a3b0/hdbscan-0.8.40-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:32ea7bc4ce8854b5549d341edc841a29766feb62f8c399520e6e0940a41c5e39", size = 4336968, upload-time = "2025-10-11T11:53:10.417Z" },
+]
 
 [[package]]
 name = "idna"

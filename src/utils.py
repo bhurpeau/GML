@@ -5,9 +5,12 @@ import torch
 import torch.nn.functional as F
 import networkx as nx
 import community as community_louvain 
-from sklearn.preprocessing import MinMaxScaler
+import hdbscan
+from sklearn.preprocessing import MinMaxScaler, normalize
+from sklearn.neighbors import NearestNeighbors
+from sklearn.cluster import DBSCAN
 from torch_geometric.data import HeteroData
-from shapely.ops import transform # Pour la transformation de coordonnées (si nécessaire)
+from shapely.ops import transform
 
 # Configuration du CRS cible pour les calculs de distance et de surface
 TARGET_CRS = "EPSG:2154" 
@@ -99,17 +102,29 @@ def load_and_prepare_real_data():
     )
     gdf_bat = gpd.read_file('data/BDT_3-5_GPKG_LAMB93_D092-ED2025-06-15.gpkg', layer='batiment')
     gdf_par = gpd.read_file('data/cadastre-92-parcelles.json')
-    
+    gdf_boundary = gpd.read_file('data/dep_bdtopo_dep_92_2025.gpkg', layer = 'dep_bdtopo_dep_92_2025')
     # 1.2 Normalisation des CRS (Lambert 93)
     TARGET_CRS = "EPSG:2154" # Assurez-vous que cette constante est définie
     gdf_adr = gdf_adr.to_crs(TARGET_CRS)
     gdf_bat = gdf_bat.to_crs(TARGET_CRS)
     gdf_par = gdf_par.to_crs(TARGET_CRS)
+    gdf_boundary = gdf_boundary.to_crs(TARGET_CRS)
+    departement_boundary = gdf_boundary.unary_union
 
+    initial_bat_count = len(gdf_bat)
+    print(f"Filtrage des bâtiments : {initial_bat_count} trouvés initialement.")
+
+    gdf_bat.geometry = gdf_bat.geometry.force_2d()
+    gdf_bat = gdf_bat[gdf_bat.within(departement_boundary)]
+    
+    filtered_bat_count = len(gdf_bat)
+    print(f"Bâtiments conservés après filtrage : {filtered_bat_count} ({initial_bat_count - filtered_bat_count} supprimés).\n")
+    
     # Assurer que les colonnes ID existent et sont renommées
     gdf_adr = gdf_adr.rename(columns={'id': 'id_adr'}).assign(id_adr=lambda x: x['id_adr'].astype(str))
     
     # Bâtiments : Créer ID et features numériques (hauteur/surface)
+    
     gdf_bat = gdf_bat.reset_index().rename(columns={'index': 'id_bat_idx'}).assign(
         id_bat=lambda x: 'BAT_' + x['id_bat_idx'].astype(str),
         surface=lambda x: x.geometry.area
@@ -188,36 +203,110 @@ def load_and_prepare_real_data():
     par_x = torch.tensor(par_features, dtype=torch.float)
     
     # --- MODIFICATION : Ajout de edge_index_ba dans le retour de la fonction ---
-    return adr_x, bat_x, par_x, edge_index_bp, edge_attr_bp, edge_index_ab, edge_index_ba, bat_map, par_map, adr_map
+    return gdf_bat, adr_x, bat_x, par_x, edge_index_bp, edge_attr_bp, edge_index_ab, edge_index_ba, bat_map, par_map, adr_map
 
 # --- FONCTION DE CLUSTERING ---
 
-def run_community_detection(embeddings_tensor, resolution=1.0, similarity_threshold=0.7):
+def perform_hdbscan_clustering(embeddings_tensor, node_map):
     """
-    Applique la détection de communautés (Louvain) sur les embeddings enrichis.
+    Effectue un clustering de Louvain sur les embeddings en construisant un graphe
+    k-NN pour éviter les problèmes de surcharge mémoire.
     """
-    import torch.nn.functional as F
+    # Paramètre clé : le nombre de voisins à considérer pour chaque nœud.
+    # 10 est un bon point de départ.
+    MIN_CLUSTER_SIZE = 5
     
-    # Calcul de la Matrice de Similitude Cosinus (vecteurs normalisés)
-    norm_embeddings = F.normalize(embeddings_tensor, p=2, dim=1)
-    sim_matrix = torch.matmul(norm_embeddings, norm_embeddings.t())
-    
-    # Création du Graphe NetworkX Pondéré
-    G = nx.Graph()
-    G.add_nodes_from(range(embeddings_tensor.size(0)))
-    
-    # Peupler les arêtes basées sur le seuil de similarité Cosinus
-    src, dst = (sim_matrix > similarity_threshold).nonzero(as_tuple=True)
-    
-    for i, j in zip(src.tolist(), dst.tolist()):
-        if i < j:
-            weight = sim_matrix[i, j].item()
-            G.add_edge(i, j, weight=weight)
-            
-    if G.number_of_edges() == 0:
-        return None
+    print(f"Lancement du clustering HDBSCAN (min_cluster_size={MIN_CLUSTER_SIZE})...")
 
-    # Application de l'algorithme de Louvain
-    partition = community_louvain.best_partition(G, weight='weight', resolution=resolution)
+    # Convertir le tenseur en array numpy
+    embeddings_np = embeddings_tensor.cpu().numpy()
+    # 1. Normalisation L2 des embeddings
+    # Chaque vecteur aura maintenant une longueur de 1.
+    print("Normalisation L2 des embeddings pour compatibilité avec les algorithmes rapides...")
+    embeddings_normalized = normalize(embeddings_np, norm='l2', axis=1)
     
-    return partition
+    # 2. Initialiser et entraîner le modèle HDBSCAN
+    clusterer = hdbscan.HDBSCAN(
+        min_cluster_size=MIN_CLUSTER_SIZE,
+        metric='euclidean',
+        algorithm='best',
+        core_dist_n_jobs=-1 # Utilise tous les cœurs CPU pour accélérer
+    )
+    
+    # .fit_predict() est un raccourci pour entraîner et obtenir les labels
+    labels = clusterer.fit_predict(embeddings_normalized)
+    
+    # 2. Formater les résultats dans un DataFrame
+    print("Formatage des résultats...")
+    # Le label -1 correspond aux points considérés comme du "bruit" (non clusterisés)
+    num_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+    num_noise = np.sum(labels == -1)
+    print(f"Détection terminée : {num_clusters} clusters trouvés, avec {num_noise} bâtiments considérés comme du bruit.")
+
+    inv_node_map = {v: k for k, v in node_map.items()}
+    
+    results = []
+    # L'index de `labels` correspond à l'index numérique des nœuds
+    for node_idx, community_id in enumerate(labels):
+        node_real_id = inv_node_map.get(node_idx)
+        if node_real_id is not None:
+            results.append({'id_bat': node_real_id, 'community': community_id})
+            
+    return pd.DataFrame(results)
+
+def perform_geographic_subclustering(gdf_bat, communities_df):
+    """
+    Post-traite les clusters sémantiques en les subdivisant géographiquement.
+    Pour chaque cluster sémantique, lance un DBSCAN géographique pour trouver les
+    sous-groupes de bâtiments contigus.
+    """
+    print("Lancement du post-traitement : sous-clustering géographique...")
+    
+    # Fusionner les résultats du clustering sémantique avec les données géographiques
+    gdf_merged = gdf_bat.merge(communities_df, on='id_bat')
+    
+    final_clusters = []
+    
+    # Traiter chaque cluster sémantique un par un (sauf le bruit)
+    semantic_clusters = gdf_merged[gdf_merged['community'] != -1]['community'].unique()
+    
+    for semantic_id in semantic_clusters:
+        gdf_semantic_cluster = gdf_merged[gdf_merged['community'] == semantic_id].copy()
+        
+        # Extraire les coordonnées pour DBSCAN
+        coords = np.array(list(zip(gdf_semantic_cluster.geometry.x, gdf_semantic_cluster.geometry.y)))
+        
+        # DBSCAN a deux paramètres clés :
+        # eps: La distance maximale entre deux points pour qu'ils soient considérés comme voisins.
+        #      Une valeur entre 25 et 50 mètres est un bon début pour des bâtiments.
+        # min_samples: Le nombre minimum de points pour former un noyau de cluster dense.
+        #      On peut le lier à notre `min_cluster_size` sémantique.
+        dbscan = DBSCAN(eps=35, min_samples=5) # 35 mètres
+        
+        geo_labels = dbscan.fit_predict(coords)
+        
+        gdf_semantic_cluster['geographic_subcluster'] = geo_labels
+        
+        # Créer un ID de cluster final unique (ex: "0_1", "0_2", "1_1", etc.)
+        # Le bruit géographique (-1) est assigné à un sous-cluster spécial.
+        gdf_semantic_cluster['final_community'] = gdf_semantic_cluster.apply(
+            lambda row: f"{row['community']}_{row['geographic_subcluster']}" if row['geographic_subcluster'] != -1 else f"{row['community']}_noise",
+            axis=1
+        )
+        
+        final_clusters.append(gdf_semantic_cluster)
+
+    # Gérer les bâtiments initialement classés comme bruit
+    noise_gdf = gdf_merged[gdf_merged['community'] == -1].copy()
+    if not noise_gdf.empty:
+        noise_gdf['final_community'] = '-1_noise'
+        final_clusters.append(noise_gdf)
+        
+    if not final_clusters:
+        print("Avertissement : Aucun cluster final n'a été formé.")
+        return pd.DataFrame()
+
+    # Concaténer tous les résultats
+    final_df = pd.concat(final_clusters, ignore_index=True)
+    
+    return final_df[['id_bat', 'final_community']]

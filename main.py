@@ -3,10 +3,11 @@
 import sys
 import torch
 import pandas as pd
+import geopandas as gpd
 from torch_geometric.data import HeteroData
 
 # Importation des modules personnalisés
-from src.utils import load_and_prepare_real_data, perform_louvain_clustering
+from src.utils import load_and_prepare_real_data, perform_hdbscan_clustering, perform_geographic_subclustering
 from src.hetero import HeteroGNN
 
 def main():
@@ -26,7 +27,7 @@ def main():
     # la normalisation et la création des tenseurs d'arêtes.
     # Notez que nous récupérons bien l'arête inverse `edge_index_ba`.
     (
-        adr_x, bat_x, par_x,
+        gdf_bat, adr_x, bat_x, par_x,
         edge_index_bp, edge_attr_bp,
         edge_index_ab, edge_index_ba,
         bat_map, par_map, adr_map
@@ -51,9 +52,9 @@ def main():
     }
     
     # Assigner les attributs d'arêtes (poids)
-    data.edge_attr_dict = {
-        ('bâtiment', 'appartient', 'parcelle'): edge_attr_bp
-    }
+    # data.edge_attr_dict = {
+    #     ('bâtiment', 'appartient', 'parcelle'): edge_attr_bp
+    # }
 
     print("Graphe construit avec succès :")
     print(data)
@@ -62,7 +63,8 @@ def main():
     print("\n--- 3. Création et Exécution du Modèle GNN ---")
 
     # Déterminer dynamiquement la taille des features pour chaque type de nœud
-    node_feature_sizes = {node_type: data[node_type].x.shape[1] for node_type in data.node_types}
+    # node_feature_sizes = {node_type: data[node_type].x.shape[1] for node_type in data.node_types}
+    node_feature_sizes = {node_type: features.shape[1] for node_type, features in data.x_dict.items()}
     print(f"Taille des features détectée : {node_feature_sizes}")
     
     bat_embeddings = None  # Initialiser en cas d'erreur
@@ -92,16 +94,23 @@ def main():
     # --- Étape 4 : Détection de Communautés (Louvain) ---
     if bat_embeddings is not None:
         print("\n--- 4. Détection de Communautés sur les Embeddings ---")
-        bat_communities_df = perform_louvain_clustering(bat_embeddings, bat_map)
+        semantic_communities_df = perform_hdbscan_clustering(bat_embeddings, bat_map)
+        # --- Étape 5 : Post-traitement Géographique (DBSCAN) ---
+        print("\n--- 5. Post-traitement : Sous-clustering Géographique ---")
+      
+        final_communities_df = perform_geographic_subclustering(gdf_bat, semantic_communities_df)
         
+        # --- Étape 6 : Sauvegarde des Résultats Finaux ---
+        num_final_communities = final_communities_df['final_community'].nunique()
+        print(f"Analyse terminée. {num_final_communities} communautés finales (sémantiques + géographiques) identifiées.")
+
+        output_path = 'out/final_building_communities.csv'
+        print(f"\n--- 6. Sauvegarde des Résultats ---\nSauvegarde dans le fichier : {output_path}")
+        final_communities_df.to_csv(output_path, index=False)
+        print("Résultats sauvegardés.")
         num_communities = bat_communities_df['community'].nunique()
         print(f"Détection terminée. {num_communities} communautés de bâtiments identifiées.")
 
-        # --- Étape 5 : Sauvegarde des Résultats ---
-        output_path = 'building_communities.csv'
-        print(f"\n--- 5. Sauvegarde des Résultats ---\nSauvegarde dans le fichier : {output_path}")
-        bat_communities_df.to_csv(output_path, index=False)
-        print("Résultats sauvegardés.")
 
     print("\n" + " Pipeline terminé avec succès ".center(80, '='))
 
