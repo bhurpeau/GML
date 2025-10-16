@@ -178,26 +178,27 @@ def prepare_node_features(gdf_bat, gdf_par, gdf_ban):
     return bat_x, par_x, ban_x
 
 def build_graph_from_golden_datasets(gdf_bat, gdf_par, gdf_ban, df_ban_links, df_parcelle_links):
-    
     print("\n--- Étape 2 : Construction du Graphe ---")
     bat_x, par_x, ban_x = prepare_node_features(gdf_bat, gdf_par, gdf_ban)
-    
+
     bat_map = {id: i for i, id in enumerate(gdf_bat['rnb_id'])}
     par_map = {id: i for i, id in enumerate(gdf_par['parcelle_id'])}
     ban_map = {id: i for i, id in enumerate(gdf_ban['ban_id'])}
 
-    # Lien Bâtiment <-> Parcelle
+    # Lien Bâtiment <-> Parcelle (logique correcte)
     bp_links = df_parcelle_links.copy()
-    bp_links['bat_idx'] = bp_links['rnb_id'].map(bat_map); bp_links['par_idx'] = bp_links['parcelle_id'].map(par_map)
+    bp_links['bat_idx'] = bp_links['rnb_id'].map(bat_map)
+    bp_links['par_idx'] = bp_links['parcelle_id'].map(par_map)
     bp_links.dropna(subset=['bat_idx', 'par_idx'], inplace=True)
     edge_index_bp = torch.tensor(bp_links[['bat_idx', 'par_idx']].values.T, dtype=torch.long)
     cover_ratio_tensor = torch.tensor(bp_links['cover_ratio'].values, dtype=torch.float).unsqueeze(1)
-    padding = torch.zeros(cover_ratio_tensor.shape[0], 1)
-    edge_attr_bp = torch.cat([cover_ratio_tensor, padding], dim=1)
+    padding_bp = torch.zeros(cover_ratio_tensor.shape[0], 1)
+    edge_attr_bp = torch.cat([cover_ratio_tensor, padding_bp], dim=1)
 
+    # --- DÉBUT DE LA CORRECTION DÉFINITIVE ---
     # Lien Adresse <-> Bâtiment (Hybride)
     print("Création des liens Adresse-Bâtiment (Sémantique + Fallback Géométrique)...")
-    
+
     # A. Combinaison des liens
     links_semantic = df_ban_links.copy(); links_semantic['link_type'] = 'semantic'
     bat_linked = links_semantic['rnb_id'].unique(); ban_linked = links_semantic['ban_id'].unique()
@@ -209,24 +210,25 @@ def build_graph_from_golden_datasets(gdf_bat, gdf_par, gdf_ban, df_ban_links, df
         links_geometric = sjoin_geo[['ban_id', 'rnb_id']].dropna(); links_geometric['link_type'] = 'geometric'
 
     all_address_links = pd.concat([links_semantic, links_geometric], ignore_index=True).drop_duplicates(subset=['rnb_id', 'ban_id'])
-    
-    # B. Mapping et FILTRAGE d'abord
+
+    # B. Mapping et FILTRAGE pour créer un DataFrame final et stable
     all_address_links['adr_idx'] = all_address_links['ban_id'].map(ban_map)
     all_address_links['bat_idx'] = all_address_links['rnb_id'].map(bat_map)
-    all_address_links.dropna(subset=['adr_idx', 'bat_idx'], inplace=True) # Le filtrage se fait ICI
+    
+    # On crée un nouveau DataFrame propre et on réinitialise son index
+    final_address_links = all_address_links.dropna(subset=['adr_idx', 'bat_idx']).reset_index(drop=True)
 
-    # C. Création des DEUX tenseurs à partir du DataFrame final et propre
-    link_type_dummies = pd.get_dummies(all_address_links['link_type'])
+    # C. Création des DEUX tenseurs à partir de ce DataFrame final et synchronisé
+    link_type_dummies = pd.get_dummies(final_address_links['link_type'])
     for col in ['semantic', 'geometric']:
         if col not in link_type_dummies: link_type_dummies[col] = 0
-    edge_attr_ab = torch.tensor(link_type_dummies[['semantic', 'geometric']].values, dtype=torch.float)
     
-    edge_index_ab = torch.tensor(all_address_links[['adr_idx', 'bat_idx']].values.T, dtype=torch.long)
+    edge_attr_ab = torch.tensor(link_type_dummies[['semantic', 'geometric']].values, dtype=torch.float)
+    edge_index_ab = torch.tensor(final_address_links[['adr_idx', 'bat_idx']].values.T, dtype=torch.long)
     # --- FIN DE LA CORRECTION DÉFINITIVE ---
 
     # Assemblage final
     data = HeteroData()
-    # ... (Le reste de la fonction est inchangé)
     data['bâtiment'].x = bat_x; data['parcelle'].x = par_x; data['adresse'].x = ban_x
     data['bâtiment', 'appartient', 'parcelle'].edge_index = edge_index_bp; data['bâtiment', 'appartient', 'parcelle'].edge_attr = edge_attr_bp
     data['parcelle', 'contient', 'bâtiment'].edge_index = edge_index_bp.flip(0); data['parcelle', 'contient', 'bâtiment'].edge_attr = edge_attr_bp
