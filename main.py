@@ -8,6 +8,9 @@ from src.utils import (
     perform_hdbscan_clustering, perform_geographic_subclustering
 )
 from src.hetero import HeteroGNN
+from src.dmon3p import DMoN3P
+from src.heads import TripletHeads
+from src.train_tripartite import train_dmon3p
 
 def main():
     """Pipeline complet pour l'analyse GML géospatiale."""
@@ -40,12 +43,29 @@ def main():
     except Exception as e:
         print(f"\nERREUR D'EXÉCUTION DU MODÈLE GNN : {e}", file=sys.stderr)
         sys.exit(1)
-
+    
     if bat_embeddings is not None:
-        semantic_communities_df = perform_hdbscan_clustering(bat_embeddings, bat_map)
-        final_communities_df = perform_geographic_subclustering(gdf_par, df_parcelle_links, semantic_communities_df)
-
-        num_final_communities = final_communities_df['final_community'].nunique()
+        L0 = M0 = N0 = 64
+        heads = TripletHeads(dim=emb_dim, L=L0, M=M0, N=N0).to(device)
+        criterion = DMoN3P(num_X=X, num_Y=Y, num_Z=Z, L=L0, M=M0, N=N0,
+                           beta=2.0, gamma=1.0, entropy_weight=1e-3, m_chunk=256).to(device)
+        optimizer = torch.optim.Adam(list(model.parameters())+list(heads.parameters()), lr=1e-3)
+        
+        # relations pour Q
+        edge_index_XY = data[('adresse','accès','bâtiment')].edge_index.to(device)
+        edge_index_YZ = data[('bâtiment','appartient','parcelle')].edge_index.to(device)
+        w_XY = None  # ou ton poids scalaire [E_ab]
+        w_YZ = None  # ou ton poids scalaire [E_bp]
+        
+        train_dmon3p(model, heads, criterion, optimizer,
+                     data, edge_index_XY, edge_index_YZ, w_XY, w_YZ,
+                     epochs=50, device=device,
+                     lam_g=1e-3, clip_grad=1.0,
+                     schedule_beta=(2.0, 10.0, 5),
+                     schedule_gamma=(1.0, 3.0, 5),
+                     prune_every=10, min_usage=2e-3, min_gate=0.10,
+                     m_chunk=256, use_amp=True)
+        
         print(f"\nAnalyse terminée. {num_final_communities} communautés finales identifiées.")
 
         output_dir = 'out'

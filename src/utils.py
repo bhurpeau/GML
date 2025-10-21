@@ -1,5 +1,5 @@
-# src/utils.py
-
+# -*- coding: utf-8 -*-
+#!/usr/bin/env python
 import pandas as pd
 import geopandas as gpd
 import numpy as np
@@ -195,7 +195,6 @@ def build_graph_from_golden_datasets(gdf_bat, gdf_par, gdf_ban, df_ban_links, df
     padding_bp = torch.zeros(cover_ratio_tensor.shape[0], 1)
     edge_attr_bp = torch.cat([cover_ratio_tensor, padding_bp], dim=1)
 
-    # --- DÉBUT DE LA CORRECTION DÉFINITIVE ---
     # Lien Adresse <-> Bâtiment (Hybride)
     print("Création des liens Adresse-Bâtiment (Sémantique + Fallback Géométrique)...")
 

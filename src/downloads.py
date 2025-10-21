@@ -1,3 +1,5 @@
+# -*- coding: utf-8 -*-
+#!/usr/bin/env python
 import fiona 
 WFS_ENDPOINT = "https://data.geopf.fr/wfs/ows" 
 PLU_LAYER_NAME = "wfs_du:zone_urba" 
