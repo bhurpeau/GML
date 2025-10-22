@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
 #!/usr/bin/env python
-import math, torch
+import math
+import torch
 import torch.nn as nn
 
+
 def inv_sigmoid(p): return math.log(p) - math.log(1-p)
+
 
 class TripletHeads(nn.Module):
     def __init__(self, dim, L, M, N, bias=False, init_gate=0.95):

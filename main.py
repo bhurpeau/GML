@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-main.py — Entraînement end-to-end avec DMoN-3p (modularité tripartite soft)
+main.py — Entraînement end-to-end avec DMoN-3p (modularité tripartite "soft")
 """
 
 import os
@@ -8,15 +8,16 @@ import argparse
 import torch
 import pandas as pd
 
-# === Modules de préparation ===
+# === Modules prétraitements ===
 from src.utils import create_golden_datasets, build_graph_from_golden_datasets
 from src.hetero import HeteroGNN
 
-# === Modules DMoN-3p ===
+# === Modules DMoN-3p fournis (voir messages précédents) ===
 from src.dmon3p import DMoN3P
 from src.heads import TripletHeads
-from src.utils_tripartite import XY_KEY, YZ_KEY
-from src.train_tripartite import train_dmon3p  
+from src.utils_tripartite import XY_KEY, YZ_KEY  # ('adresse','accès','bâtiment'), ('bâtiment','appartient','parcelle')
+from src.train_tripartite import train_dmon3p
+
 
 def parse_args():
     p = argparse.ArgumentParser(description="DMoN-3p training (tripartite soft modularity)")
@@ -40,6 +41,10 @@ def parse_args():
 
 
 def maybe_pick_scalar_weight(edge_attr):
+    """Heuristique simple: si edge_attr existe
+       - d==1 -> on le prend
+       - d>1  -> on prend la 1ère colonne
+    """
     if edge_attr is None:
         return None
     if edge_attr.dim() == 1:
@@ -116,34 +121,53 @@ def main():
         device=device,
         lam_g=1e-3,
         clip_grad=1.0,
-        schedule_beta=(args.beta, 10.0, 5),
-        schedule_gamma=(args.gamma, 3.0, 5),
+        schedule_beta=(args.beta, 8.0, 10),
+        schedule_gamma=(args.gamma, 2.0, 10),
         prune_every=args.epochs_prune,
         min_usage=2e-3,
         min_gate=0.10,
         m_chunk=args.m_chunk,
-        use_amp=True
+        use_amp=False
     )
 
     # === Inférence finale ===
     print("=== Inférence des communautés finales ===")
-    model.eval(); heads.eval()
+    model.eval()
+    heads.eval()
     with torch.no_grad():
-        x_dict = {k: v.to(device) for k,v in data.x_dict.items()}
-        edge_index_dict = {k: v.to(device) for k,v in data.edge_index_dict.items()}
-        h_dict = model(x_dict, edge_index_dict)
+        x_dict = {k: v.to(device) for k, v in data.x_dict.items()}
+        edge_index_dict = {k: v.to(device) for k, v in data.edge_index_dict.items()}
+        edge_attr_dict = {}
+        for rel in data.edge_types:
+            ea = getattr(data[rel], 'edge_attr', None)
+            edge_attr_dict[rel] = ea.to(device) if ea is not None else None
+        h_dict = model(x_dict, edge_index_dict, edge_attr_dict)
         from torch.nn.functional import softmax
-        Sy = softmax(heads.head_Y(h_dict['bâtiment']), dim=1).cpu()
+        Sx_logits, Sy_logits, Sz_logits, (gX, gY, gZ) = heads(
+        h_dict['adresse'], h_dict['bâtiment'], h_dict['parcelle']
+        )
+        Sy = softmax(Sy_logits, dim=1).cpu()
         yY = Sy.argmax(dim=1).numpy()
+    import numpy as np
+    hard = Sy.argmax(dim=1).numpy()
+    uniq, cnt = np.unique(hard, return_counts=True)
+    print("Répartition Y:", dict(zip(uniq.tolist(), cnt.tolist())))
+    print("Nb clusters utilisés (Y):", len(uniq))
+    print("Gates Y (min/med/max):", float(gY.min()), float(gY.median()), float(gY.max()))
+    print("Usage moyen par colonne (Y):", Sy.mean(dim=0).numpy())
+  
+    # Export des communautés de bâtiments (compatibles avec ton ancien export)
+    inv_bat_map = {v: k for k, v in bat_map.items()}
+    ids_bat = [inv_bat_map.get(i, f"unk_{i}") for i in range(len(hard))]
 
-    # Export des communautés de bâtiments
-    inv_bat_map = {v:k for k,v in bat_map.items()}
-    df_out = pd.DataFrame({
-        "id_bat": [inv_bat_map[i] for i in range(len(yY))],
-        "community": yY
-    })
-    df_out.to_csv(args.out_csv, index=False)
+    os.makedirs("out", exist_ok=True)
+    pd.DataFrame({
+        "id_bat": ids_bat,
+        "community": hard
+    }).to_csv(args.out_csv, index=False)
+
     print(f"Résultats écrits dans {args.out_csv}")
+
 
 if __name__ == "__main__":
     main()

@@ -1,42 +1,56 @@
 # -*- coding: utf-8 -*-
 #!/usr/bin/env python
-import torch, math
-from torch.cuda.amp import autocast, GradScaler
 
-# pruning util: compresse physiquement les colonnes faibles des têtes et met à jour DMoN3P
-def prune_columns(heads, criterion, usage, gates, min_usage=2e-3, min_gate=0.10, which='Y'):
+import torch
+from typing import Optional
+
+# -------------------------------------------------------------------
+# Pruning: compresse physiquement les sorties (lignes) des têtes et
+# ajuste les dimensions L/M/N dans le critère.
+# -------------------------------------------------------------------
+
+
+def prune_columns(heads, criterion, usage, gates,
+                  min_usage: float = 2e-3, min_gate: float = 0.10,
+                  which: str = 'Y'):
     """
-    usage: dict {'X': uX, 'Y': uY, 'Z': uZ} with mean probs per column (1D tensors)
-    gates: dict {'X': gX, 'Y': gY, 'Z': gZ} with current gate values (1D tensors)
-    which: 'X' or 'Y' or 'Z' or 'all'
-    returns: mask dict + new heads/criterion (in-place reinit)
+    usage: dict {'X': uX, 'Y': uY, 'Z': uZ} usages moyens par colonne (1D)
+    gates: dict {'X': gX, 'Y': gY, 'Z': gZ} valeurs actuelles des portes (1D)
+    which: 'X'|'Y'|'Z'|'all' : quel type pruner
+    Retourne: dict de masques booléens
     """
     masks = {}
-    for key, LMN, head_layer, logit_g in [
+
+    for key, KMN, head_layer, logit_g in [
         ('X', criterion.L, heads.head_X, heads.logit_gX),
         ('Y', criterion.M, heads.head_Y, heads.logit_gY),
         ('Z', criterion.N, heads.head_Z, heads.logit_gZ),
     ]:
-        if which != 'all' and which != key: 
-            masks[key] = torch.ones(LMN, dtype=torch.bool, device=logit_g.device)
+        if which != 'all' and which != key:
+            masks[key] = torch.ones(KMN, dtype=torch.bool, device=logit_g.device)
             continue
-        u = usage[key]          # [K]
-        g = gates[key]          # [K]
+
+        u = usage[key]   # [K]
+        g = gates[key]   # [K]
         mask = (u > min_usage) & (g > min_gate)
-        # keep at least 2 columns per type
+
+        # Toujours en garder au moins 2
         if mask.sum() < 2:
             top2 = torch.topk(u, k=min(2, u.numel())).indices
             mask[top2] = True
+
         masks[key] = mask
 
-        # compress layer weights
-        if mask.sum() < LMN:
+        # Compression des sorties = LIGNES du poids
+        if mask.sum() < KMN:
             with torch.no_grad():
-                W = head_layer.weight.data[:, mask]        
+                W = head_layer.weight.data[mask, :]    # (kept_out, in_features)
                 head_layer.weight = torch.nn.Parameter(W)
                 if head_layer.bias is not None:
-                    head_layer.bias = torch.nn.Parameter(head_layer.bias.data)
-                # shrink gates
+                    b = head_layer.bias.data[mask]     # (kept_out,)
+                    head_layer.bias = torch.nn.Parameter(b)
+
+                # Gates correspondantes
                 new_logit = logit_g.data[mask]
                 if key == 'X':
                     heads.logit_gX = torch.nn.Parameter(new_logit)
@@ -45,7 +59,7 @@ def prune_columns(heads, criterion, usage, gates, min_usage=2e-3, min_gate=0.10,
                 else:
                     heads.logit_gZ = torch.nn.Parameter(new_logit)
 
-            # update criterion dims
+            # Mise à jour des dimensions dans le critère
             if key == 'X':
                 criterion.L = int(mask.sum())
             elif key == 'Y':
@@ -55,70 +69,133 @@ def prune_columns(heads, criterion, usage, gates, min_usage=2e-3, min_gate=0.10,
 
     return masks
 
+
+# -------------------------------------------------------------------
+# Entraînement DMoN-3p avec annealing, pruning différé et Optuna (optionnel)
+# -------------------------------------------------------------------
 def train_dmon3p(
     model, heads, criterion, optimizer,
-    data, edge_index_XY, edge_index_YZ, w_XY=None, w_YZ=None,
-    epochs=50, device='cuda',
-    lam_g=1e-3,           # L1 sur les gates
-    clip_grad=1.0,        # gradient clipping
-    schedule_beta=(2.0, 10.0, 5),  # (start, max, step_epochs)
-    schedule_gamma=(1.0, 3.0, 5),  # (start, max, step_epochs)
-    prune_every=10, min_usage=2e-3, min_gate=0.10,
-    m_chunk=256, use_amp=True
+    data, edge_index_XY, edge_index_YZ, w_XY: Optional[torch.Tensor] = None, w_YZ: Optional[torch.Tensor] = None,
+    epochs: int = 50, device: str = 'cuda',
+    lam_g: float = 1e-3,                 # L1 sur les gates
+    clip_grad: float = 1.0,              # gradient clipping
+    schedule_beta=(2.0, 8.0, 10),      # (start, max, step_epochs)
+    schedule_gamma=(1.0, 2.0, 10),     # (start, max, step_epochs)
+    anneal_delay_epoch: int = 0,         # ne pas annealer avant cette époque
+    prune_every: int = 10, min_usage: float = 2e-3, min_gate: float = 0.10,
+    prune_delay_epoch: int = 50,         # ne pas pruner avant cette époque
+    m_chunk: int = 256, use_amp: bool = True,
+    trial = None                         # Optuna Trial optionnel
 ):
+    # Init paramètres du critère
     criterion.beta = schedule_beta[0]
     criterion.gamma = schedule_gamma[0]
     criterion.m_chunk = m_chunk
 
-    scaler = GradScaler(enabled=use_amp)
-    for epoch in range(1, epochs+1):
+    scaler = torch.amp.GradScaler(device, enabled=use_amp)
+    best_Q = float("-inf")
+
+    for epoch in range(1, epochs + 1):
         model.train(); heads.train()
         optimizer.zero_grad(set_to_none=True)
 
-        x_dict = {k: v.to(device) for k,v in data.x_dict.items()}
-        edge_index_dict = {k: v.to(device) for k,v in data.edge_index_dict.items()}
-
-        # optional edge_attr dict if your encoder uses it
+        # Prépare batch complet (tu peux mettre un loader si besoin)
+        x_dict = {k: v.to(device) for k, v in data.x_dict.items()}
+        edge_index_dict = {k: v.to(device) for k, v in data.edge_index_dict.items()}
         edge_attr_dict = {}
         for rel in data.edge_types:
             ea = getattr(data[rel], 'edge_attr', None)
             edge_attr_dict[rel] = ea.to(device) if ea is not None else None
 
-        # forward encoder
-        with autocast(enabled=use_amp):
+        with torch.amp.autocast(device, enabled=use_amp):
+            # Encodage
             h_dict = model(x_dict, edge_index_dict, edge_attr_dict)
             hX, hY, hZ = h_dict['adresse'], h_dict['bâtiment'], h_dict['parcelle']
+
+            # Têtes (inclut log(gates))
             Sx_logits, Sy_logits, Sz_logits, (gX, gY, gZ) = heads(hX, hY, hZ)
-            out = criterion(Sx_logits, Sy_logits, Sz_logits, edge_index_XY, w_XY, edge_index_YZ, w_YZ)
-            # L1 on gates (encourage extinction)
+
+            # Perte DMoN-3p
+            out = criterion(
+                Sx_logits, Sy_logits, Sz_logits,
+                edge_index_XY, w_XY,
+                edge_index_YZ, w_YZ
+            )
+
+            # L1 sur gates
             loss = out["loss"] + lam_g * (gX.sum() + gY.sum() + gZ.sum())
 
+        # Backprop
         scaler.scale(loss).backward()
         if clip_grad is not None:
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(list(model.parameters())+list(heads.parameters()), clip_grad)
-        scaler.step(optimizer); scaler.update()
+            torch.nn.utils.clip_grad_norm_(list(model.parameters()) + list(heads.parameters()), clip_grad)
+        scaler.step(optimizer)
+        scaler.update()
 
+        # Logs
         if epoch == 1 or epoch % 5 == 0:
             print(f"[{epoch:03d}] loss={float(loss):.4f}  Q={float(out['Q']):.4f}  "
                   f"(Q_obs={float(out['Q_obs']):.4f}  Q_exp={float(out['Q_exp']):.4f})  "
-                  f"L/M/N={criterion.L}/{criterion.M}/{criterion.N}  beta={criterion.beta:.2f}  gamma={criterion.gamma:.2f}")
+                  f"L/M/N={criterion.L}/{criterion.M}/{criterion.N}  "
+                  f"beta={criterion.beta:.2f}  gamma={criterion.gamma:.2f}")
 
-        # schedules β, γ
-        if epoch % schedule_beta[2] == 0:
-            criterion.beta = min(schedule_beta[1], criterion.beta + 0.3)
-        if epoch % schedule_gamma[2] == 0:
-            criterion.gamma = min(schedule_gamma[1], criterion.gamma * 1.1)
+        # Garder meilleur Q
+        Q = float(out["Q"])
+        if Q > best_Q:
+            best_Q = Q
 
-        # pruning (sur Y prioritairement, puis X,Z si besoin)
-        if prune_every and epoch % prune_every == 0:
+        # --- Reporting Optuna (optionnel) ---
+        if trial is not None:
+            # reporte Q au step=epoch
+            try:
+                trial.report(Q, epoch)
+                if trial.should_prune():
+                    raise Exception("OPTUNA_PRUNE")
+            except Exception as _e:
+                # Permet d'utiliser train_dmon3p sans dépendre d'Optuna installé
+                if str(_e) == "OPTUNA_PRUNE":
+                    raise  # laisser l'appelant gérer optuna.TrialPruned
+                # sinon on ignore et on continue (pas d'optuna)
+
+        # --- Annealing (après délai) ---
+        if epoch > anneal_delay_epoch:
+            if schedule_beta[2] and epoch % schedule_beta[2] == 0:
+                criterion.beta = min(schedule_beta[1], criterion.beta + 0.3)
+            if schedule_gamma[2] and epoch % schedule_gamma[2] == 0:
+                criterion.gamma = min(schedule_gamma[1], criterion.gamma * 1.1)
+
+        # --- Pruning (après délai) ---
+        if prune_every and epoch >= prune_delay_epoch and epoch % prune_every == 0:
             with torch.no_grad():
-                Sx = torch.softmax(Sx_logits, dim=1).mean(dim=0)  # usage moyen
-                Sy = torch.softmax(Sy_logits, dim=1).mean(dim=0)
-                Sz = torch.softmax(Sz_logits, dim=1).mean(dim=0)
-                masks = prune_columns(
+                Sx_mean = torch.softmax(Sx_logits, dim=1).mean(dim=0)
+                Sy_mean = torch.softmax(Sy_logits, dim=1).mean(dim=0)
+                Sz_mean = torch.softmax(Sz_logits, dim=1).mean(dim=0)
+                prune_columns(
                     heads, criterion,
-                    usage={'X': Sx, 'Y': Sy, 'Z': Sz},
+                    usage={'X': Sx_mean, 'Y': Sy_mean, 'Z': Sz_mean},
                     gates={'X': gX, 'Y': gY, 'Z': gZ},
-                    min_usage=min_usage, min_gate=min_gate, which='Y'  # on cible Y (bâtiment)
+                    min_usage=min_usage, min_gate=min_gate, which='Y'  # priorité Y
                 )
+
+    # ----------------------
+    # Inférence "soft" finale
+    # ----------------------
+    model.eval(); heads.eval()
+    with torch.no_grad():
+        x_dict = {k: v.to(device) for k, v in data.x_dict.items()}
+        edge_index_dict = {k: v.to(device) for k, v in data.edge_index_dict.items()}
+        edge_attr_dict = {}
+        for rel in data.edge_types:
+            ea = getattr(data[rel], 'edge_attr', None)
+            edge_attr_dict[rel] = ea.to(device) if ea is not None else None
+
+        # IMPORTANT: repasser par la tête complète (gates + pruning pris en compte)
+        Sx_logits, Sy_logits, Sz_logits, _ = heads(
+            model(x_dict, edge_index_dict, edge_attr_dict)['adresse'],
+            model(x_dict, edge_index_dict, edge_attr_dict)['bâtiment'],
+            model(x_dict, edge_index_dict, edge_attr_dict)['parcelle'],
+        )
+        Sy = torch.softmax(Sy_logits, dim=1).cpu()
+
+    return {"Q_final": best_Q, "Sy": Sy}
