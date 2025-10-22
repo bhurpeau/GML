@@ -1,82 +1,149 @@
-# main.py
+# -*- coding: utf-8 -*-
+"""
+main.py — Entraînement end-to-end avec DMoN-3p (modularité tripartite soft)
+"""
 
-import sys
 import os
+import argparse
 import torch
-from src.utils import (
-    create_golden_datasets, build_graph_from_golden_datasets,
-    perform_hdbscan_clustering, perform_geographic_subclustering
-)
+import pandas as pd
+
+# === Modules de préparation ===
+from src.utils import create_golden_datasets, build_graph_from_golden_datasets
 from src.hetero import HeteroGNN
+
+# === Modules DMoN-3p ===
 from src.dmon3p import DMoN3P
 from src.heads import TripletHeads
-from src.train_tripartite import train_dmon3p
+from src.utils_tripartite import XY_KEY, YZ_KEY
+from src.train_tripartite import train_dmon3p  
+
+def parse_args():
+    p = argparse.ArgumentParser(description="DMoN-3p training (tripartite soft modularity)")
+    p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--epochs", type=int, default=50)
+    p.add_argument("--hidden", type=int, default=64)
+    p.add_argument("--emb_dim", type=int, default=64)
+    p.add_argument("--L", type=int, default=64, help="#clusters max for X (adresses)")
+    p.add_argument("--M", type=int, default=64, help="#clusters max for Y (bâtiments)")
+    p.add_argument("--N", type=int, default=64, help="#clusters max for Z (parcelles)")
+    p.add_argument("--beta", type=float, default=2.0)
+    p.add_argument("--gamma", type=float, default=1.0)
+    p.add_argument("--entropy_weight", type=float, default=1e-3)
+    p.add_argument("--lambda_collapse", type=float, default=1e-4)
+    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--weight_decay", type=float, default=0.0)
+    p.add_argument("--m_chunk", type=int, default=256)
+    p.add_argument("--epochs_prune", type=int, default=10)
+    p.add_argument("--out_csv", type=str, default="out/final_building_communities_dmon3p.csv")
+    return p.parse_args()
+
+
+def maybe_pick_scalar_weight(edge_attr):
+    if edge_attr is None:
+        return None
+    if edge_attr.dim() == 1:
+        return edge_attr
+    if edge_attr.size(1) >= 1:
+        w = edge_attr[:, 0]
+        if w.abs().sum() == 0:
+            w = edge_attr.sum(dim=1)
+        return w
+    return None
+
 
 def main():
-    """Pipeline complet pour l'analyse GML géospatiale."""
-    print(" Lancement du Pipeline GML Géospatial Complet ".center(80, '='))
+    args = parse_args()
+    device = args.device
+    os.makedirs("out", exist_ok=True)
 
+    print("=== Chargement des données ===")
     gdf_bat, gdf_par, gdf_ban, df_ban_links, df_parcelle_links = create_golden_datasets()
-    graph_data, bat_map = build_graph_from_golden_datasets(gdf_bat, gdf_par, gdf_ban, df_ban_links, df_parcelle_links)
+    data, bat_map = build_graph_from_golden_datasets(
+        gdf_bat, gdf_par, gdf_ban, df_ban_links, df_parcelle_links
+    )
 
-    print("\n--- 3. Création et Exécution du Modèle GNN ---")
-    node_feature_sizes = {node_type: features.shape[1] for node_type, features in graph_data.x_dict.items()}
+    for nt in ('adresse', 'bâtiment', 'parcelle'):
+        if nt not in data.node_types:
+            raise KeyError(f"Type de nœud manquant : {nt}. Trouvés : {data.node_types}")
 
-    # AMÉLIORATION : On récupère une seule taille car elles sont maintenant toutes unifiées
-    edge_feature_size = graph_data['adresse', 'accès', 'bâtiment'].edge_attr.shape[1]
-    edge_attr_dict = {rel: graph_data[rel].edge_attr for rel in graph_data.edge_types}
+    node_feature_sizes = {nt: data[nt].x.size(1) for nt in data.node_types}
+    X = data['adresse'].x.size(0)
+    Y = data['bâtiment'].x.size(0)
+    Z = data['parcelle'].x.size(0)
 
-    bat_embeddings = None
-    try:
-        model = HeteroGNN(
-            hidden_channels=64, out_channels=32, num_layers=1,
-            node_feature_sizes=node_feature_sizes,
-            edge_feature_size=edge_feature_size
-        )
-        print("Modèle GNN Hétérogène (GATv2) créé.")
+    print("=== Initialisation du modèle ===")
+    model = HeteroGNN(
+        hidden_channels=args.hidden,
+        out_channels=args.emb_dim,
+        num_layers=2,
+        node_feature_sizes=node_feature_sizes,
+        edge_feature_size=None
+    ).to(device)
 
-        with torch.no_grad():
-            model.eval()
-            embeddings_dict = model(graph_data.x_dict, graph_data.edge_index_dict, edge_attr_dict)
-        bat_embeddings = embeddings_dict['bâtiment']
-        print(f"\nEmbeddings pour les bâtiments générés avec succès. Shape : {bat_embeddings.shape}")
-    except Exception as e:
-        print(f"\nERREUR D'EXÉCUTION DU MODÈLE GNN : {e}", file=sys.stderr)
-        sys.exit(1)
-    
-    if bat_embeddings is not None:
-        L0 = M0 = N0 = 64
-        heads = TripletHeads(dim=emb_dim, L=L0, M=M0, N=N0).to(device)
-        criterion = DMoN3P(num_X=X, num_Y=Y, num_Z=Z, L=L0, M=M0, N=N0,
-                           beta=2.0, gamma=1.0, entropy_weight=1e-3, m_chunk=256).to(device)
-        optimizer = torch.optim.Adam(list(model.parameters())+list(heads.parameters()), lr=1e-3)
-        
-        # relations pour Q
-        edge_index_XY = data[('adresse','accès','bâtiment')].edge_index.to(device)
-        edge_index_YZ = data[('bâtiment','appartient','parcelle')].edge_index.to(device)
-        w_XY = None  # ou ton poids scalaire [E_ab]
-        w_YZ = None  # ou ton poids scalaire [E_bp]
-        
-        train_dmon3p(model, heads, criterion, optimizer,
-                     data, edge_index_XY, edge_index_YZ, w_XY, w_YZ,
-                     epochs=50, device=device,
-                     lam_g=1e-3, clip_grad=1.0,
-                     schedule_beta=(2.0, 10.0, 5),
-                     schedule_gamma=(1.0, 3.0, 5),
-                     prune_every=10, min_usage=2e-3, min_gate=0.10,
-                     m_chunk=256, use_amp=True)
-        
-        print(f"\nAnalyse terminée. {num_final_communities} communautés finales identifiées.")
+    heads = TripletHeads(dim=args.emb_dim, L=args.L, M=args.M, N=args.N).to(device)
+    criterion = DMoN3P(
+        num_X=X, num_Y=Y, num_Z=Z,
+        L=args.L, M=args.M, N=args.N,
+        beta=args.beta,
+        gamma=args.gamma,
+        entropy_weight=args.entropy_weight,
+        lambda_X=args.lambda_collapse,
+        lambda_Y=args.lambda_collapse,
+        lambda_Z=args.lambda_collapse,
+        m_chunk=args.m_chunk
+    ).to(device)
 
-        output_dir = 'out'
-        os.makedirs(output_dir, exist_ok=True)
-        output_path = os.path.join(output_dir, 'final_building_communities.csv')
+    optimizer = torch.optim.Adam(
+        list(model.parameters()) + list(heads.parameters()),
+        lr=args.lr, weight_decay=args.weight_decay
+    )
 
-        print(f"Sauvegarde des résultats dans : {output_path}")
-        final_communities_df.to_csv(output_path, index=False)
-        print("Résultats sauvegardés.")
+    # Préparer les relations pour la perte
+    edge_index_XY = data[XY_KEY].edge_index.to(device)
+    edge_index_YZ = data[YZ_KEY].edge_index.to(device)
+    w_XY = maybe_pick_scalar_weight(getattr(data[XY_KEY], 'edge_attr', None))
+    w_YZ = maybe_pick_scalar_weight(getattr(data[YZ_KEY], 'edge_attr', None))
+    if w_XY is not None: w_XY = w_XY.to(device)
+    if w_YZ is not None: w_YZ = w_YZ.to(device)
 
-    print("\n" + " Pipeline terminé avec succès ".center(80, '='))
+    # === Entraînement complet via train_loop ===
+    print("=== Entraînement DMoN-3p (avec pruning, annealing et AMP) ===")
+    train_dmon3p(
+        model, heads, criterion, optimizer,
+        data, edge_index_XY, edge_index_YZ, w_XY=w_XY, w_YZ=w_YZ,
+        epochs=args.epochs,
+        device=device,
+        lam_g=1e-3,
+        clip_grad=1.0,
+        schedule_beta=(args.beta, 10.0, 5),
+        schedule_gamma=(args.gamma, 3.0, 5),
+        prune_every=args.epochs_prune,
+        min_usage=2e-3,
+        min_gate=0.10,
+        m_chunk=args.m_chunk,
+        use_amp=True
+    )
+
+    # === Inférence finale ===
+    print("=== Inférence des communautés finales ===")
+    model.eval(); heads.eval()
+    with torch.no_grad():
+        x_dict = {k: v.to(device) for k,v in data.x_dict.items()}
+        edge_index_dict = {k: v.to(device) for k,v in data.edge_index_dict.items()}
+        h_dict = model(x_dict, edge_index_dict)
+        from torch.nn.functional import softmax
+        Sy = softmax(heads.head_Y(h_dict['bâtiment']), dim=1).cpu()
+        yY = Sy.argmax(dim=1).numpy()
+
+    # Export des communautés de bâtiments
+    inv_bat_map = {v:k for k,v in bat_map.items()}
+    df_out = pd.DataFrame({
+        "id_bat": [inv_bat_map[i] for i in range(len(yY))],
+        "community": yY
+    })
+    df_out.to_csv(args.out_csv, index=False)
+    print(f"Résultats écrits dans {args.out_csv}")
 
 if __name__ == "__main__":
     main()
