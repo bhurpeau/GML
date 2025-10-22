@@ -1,8 +1,0 @@
-# Python-generated files
-__pycache__/
-*.py[oc]
-data/
-# Virtual environments
-.venv
-**/.ipynb_checkpoints/
-./**/.ipynb_checkpoints/

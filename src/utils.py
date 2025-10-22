@@ -1,312 +1,293 @@
+# -*- coding: utf-8 -*-
+#!/usr/bin/env python
 import pandas as pd
-import numpy as np
 import geopandas as gpd
+import numpy as np
+import ast
 import torch
-import torch.nn.functional as F
-import networkx as nx
-import community as community_louvain 
 import hdbscan
-from sklearn.preprocessing import MinMaxScaler, normalize
-from sklearn.neighbors import NearestNeighbors
-from sklearn.cluster import DBSCAN
+import networkx as nx
 from torch_geometric.data import HeteroData
-from shapely.ops import transform
+from sklearn.preprocessing import MinMaxScaler, normalize
 
-# Configuration du CRS cible pour les calculs de distance et de surface
-TARGET_CRS = "EPSG:2154" 
-SCALER = MinMaxScaler()
+# --- CONSTANTES ET CHEMINS ---
+TARGET_CRS = "EPSG:2154"
+BDTOPO_PATH = 'data/BDT_3-5_GPKG_LAMB93_D092-ED2025-06-15.gpkg'
+BOUNDARY_PATH = 'data/dep_bdtopo_dep_92_2025.gpkg'
+PARCEL_PATH = 'data/cadastre-92-parcelles.json'
+BDNB_PATH = 'data/bdnb.gpkg'
+RNB_PATH = 'data/RNB_92.csv'
+BAN_PATH = 'data/adresses-92.csv'
+PLU_PATH = 'data/wfs_du.gpkg'
 
-# --- FONCTIONS DE PRÉ-TRAITEMENT DES DONNÉES (CONCRETES) ---
 
-def normalize_features(df, columns_to_normalize):
-    """Applique la normalisation Min-Max aux colonnes spécifiées pour éviter le déséquilibre."""
-    # S'assurer que les colonnes sont numériques et gérer les NaN (remplissage par la moyenne)
-    for col in columns_to_normalize:
-        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(df[col].mean())
-
-    if not df[columns_to_normalize].empty:
-        df[columns_to_normalize] = SCALER.fit_transform(df[columns_to_normalize])
-    return df
+def parse_rnb_links(df_rnb):
+    """Parse les colonnes string du RNB pour extraire les tables de liens et les poids."""
+    print("Parsing du fichier RNB pour extraire les liens...")
+    links = {'ban': [], 'parcelle': [], 'bdnb': []}
+    for _, row in df_rnb.iterrows():
+        rnb_id = row['rnb_id']
+        if isinstance(row['addresses'], str):
+            try:
+                for addr in ast.literal_eval(row['addresses']):
+                    if 'cle_interop_ban' in addr:
+                        links['ban'].append({'rnb_id': rnb_id, 'ban_id': addr['cle_interop_ban']})
+            except (ValueError, SyntaxError): pass
+        if isinstance(row['plots'], str):
+            try:
+                for plot in ast.literal_eval(row['plots']):
+                    if 'id' in plot:
+                        ratio = plot.get('bdg_cover_ratio', 0.0)
+                        links['parcelle'].append({'rnb_id': rnb_id, 'parcelle_id': plot['id'], 'cover_ratio': float(ratio)})
+            except (ValueError, SyntaxError): pass
+        if isinstance(row['ext_ids'], str):
+            try:
+                for ext_id in ast.literal_eval(row['ext_ids']):
+                    if ext_id.get('source') == 'bdnb':
+                        links['bdnb'].append({'rnb_id': rnb_id, 'batiment_construction_id': ext_id['id']})
+            except (ValueError, SyntaxError): pass
+    return pd.DataFrame(links['ban']).drop_duplicates(), pd.DataFrame(links['parcelle']), pd.DataFrame(links['bdnb']).drop_duplicates()
 
 def perform_semantic_sjoin(gdf_parcelles, gdf_usage_sol):    
-    # 1. Normalisation des CRS (CRUCIAL)
     gdf_usage_sol = gdf_usage_sol.rename(columns={'libelle': 'LIBELLE','typezone':'TYPEZONE'})
-    # a) Normaliser les Parcelles
     if gdf_parcelles.crs is None or gdf_parcelles.crs != TARGET_CRS:
-        # Tenter de définir le CRS si non défini (souvent 4326 si c'est du GeoJSON/WKT)
         if gdf_parcelles.crs is None:
-            # Si le Cadastre est en WGS84 (lat/lon), définir 4326 puis reprojeter
-            print("Définition temporaire du CRS des Parcelles à EPSG:4326...")
             gdf_parcelles = gdf_parcelles.set_crs("EPSG:4326", allow_override=True)
-            
-        print(f"Reprojection des Parcelles vers {TARGET_CRS}...")
+
         gdf_parcelles = gdf_parcelles.to_crs(TARGET_CRS)
-    # b) Normaliser les Zones PLU
     if gdf_usage_sol.crs is None or gdf_usage_sol.crs != TARGET_CRS:
-        # Le WFS est souvent en 4326, donc on le reprojette
         if gdf_usage_sol.crs is None:
              print("Définition temporaire du CRS des Zones PLU à EPSG:4326...")
              gdf_usage_sol = gdf_usage_sol.set_crs("EPSG:4326", allow_override=True)
              
         print(f"Reprojection des Zones PLU vers {TARGET_CRS}...")
         gdf_usage_sol = gdf_usage_sol.to_crs(TARGET_CRS)
-    # 2. Préparation pour le Predicate 'within' (Le Point Représentatif)
-    # Remplacement du centroïde par le point représentatif (garanti à l'intérieur du polygone)
     
     gdf_parcelles_points = gdf_parcelles.copy()
-    print("Calcul du point représentatif des Parcelles (point garanti dans la géométrie)...")
     gdf_parcelles_points['geometry'] = gdf_parcelles_points['geometry'].apply(lambda x: x.representative_point())
-
-
-    # 3. Jointure Spatiale Robuste
-    # On joint les points représentatifs des parcelles avec les polygones de zone PLU.
-    # Predicate='within' : vérifie si le point est DANS la zone PLU
-    
-    print("Exécution de la jointure spatiale (Parcelle.ReprensentativePoint WITHIN Zone PLU)...")
-    
-    # Jointure pour récupérer le code PLU
     gdf_parcelles_enriched = gdf_parcelles_points.sjoin(
-        gdf_usage_sol[['LIBELLE', 'TYPEZONE', 'geometry']], # Sélectionner uniquement la géométrie et la feature sémantique
+        gdf_usage_sol[['LIBELLE', 'TYPEZONE', 'geometry']], 
         how='left', 
         predicate='within'
     )
     
-     
-    # Conserver les colonnes utiles pour le GML (on garde l'ID de la parcelle)
-    final_features = gdf_parcelles_enriched[['id_par', 'superficie','LIBELLE','TYPEZONE']].copy()
-    final_features = final_features.merge(gdf_parcelles[['id_par','geometry']], how='left', on='id_par')
+    final_features = gdf_parcelles_enriched[['parcelle_id', 'LIBELLE','TYPEZONE']].copy()
+    final_features = final_features.merge(gdf_parcelles[['parcelle_id','geometry']], how='left', on='parcelle_id')
     final_features = gpd.GeoDataFrame(
-                    final_features[['id_par','superficie','LIBELLE','TYPEZONE']], 
+                    final_features[['parcelle_id','LIBELLE','TYPEZONE']], 
                     geometry=final_features.geometry, 
                     crs=TARGET_CRS
                 )
-    # Retourner les features enrichies (la colonne PLU_LIBELLE est ajoutée)
+
     return final_features
 
-def load_and_prepare_real_data():
-    """
-    Charge les fichiers réels, prépare les features (normalisation + PLU), 
-    et crée les arêtes par jointure spatiale.
-    Cette version inclut les arêtes inverses ('bâtiment' -> 'adresse') pour
-    permettre la propagation des messages dans les deux sens.
-    """
-    print("--- 1. Chargement et Préparation des Données Réelles ---")
+def create_golden_datasets():
+    """Charge et fusionne toutes les sources pour créer les datasets de base."""
+    print("--- Étape 1 : Création des Golden Datasets ---")
+    df_rnb = pd.read_csv(RNB_PATH, sep=";", dtype=str)
+    df_ban_links, df_parcelle_links, df_bdnb_links = parse_rnb_links(df_rnb)
 
-    # 1.1 Chargement des fichiers
-    # (Le code de chargement et de préparation initiale reste identique)
-    df_adr = pd.read_csv('data/adresses-92.csv', delimiter=';', low_memory=False)
-    gdf_adr = gpd.GeoDataFrame(
-        df_adr, 
-        geometry=gpd.points_from_xy(df_adr['lon'], df_adr['lat']), 
-        crs="EPSG:4326"
-    )
-    gdf_bat = gpd.read_file('data/BDT_3-5_GPKG_LAMB93_D092-ED2025-06-15.gpkg', layer='batiment')
-    gdf_par = gpd.read_file('data/cadastre-92-parcelles.json')
-    gdf_boundary = gpd.read_file('data/dep_bdtopo_dep_92_2025.gpkg', layer = 'dep_bdtopo_dep_92_2025')
-    # 1.2 Normalisation des CRS (Lambert 93)
-    TARGET_CRS = "EPSG:2154" # Assurez-vous que cette constante est définie
-    gdf_adr = gdf_adr.to_crs(TARGET_CRS)
-    gdf_bat = gdf_bat.to_crs(TARGET_CRS)
-    gdf_par = gdf_par.to_crs(TARGET_CRS)
+    gdf_bdtopo = gpd.read_file(BDTOPO_PATH, layer='batiment')
+    gdf_boundary = gpd.read_file(BOUNDARY_PATH)
+    gdf_bdtopo = gdf_bdtopo.to_crs(TARGET_CRS)
     gdf_boundary = gdf_boundary.to_crs(TARGET_CRS)
     departement_boundary = gdf_boundary.unary_union
+    gdf_bdtopo = gdf_bdtopo[gdf_bdtopo.within(departement_boundary)].copy()
+    gdf_bdtopo.rename(columns={'identifiants_rnb': 'rnb_id'}, inplace=True)
+    gdf_bdtopo.dropna(subset=['rnb_id'], inplace=True)
+    
+    df_construction = gpd.read_file(BDNB_PATH, layer='batiment_construction')[['batiment_construction_id', 'batiment_groupe_id']]
+    df_groupe_compile = gpd.read_file(BDNB_PATH, layer='batiment_groupe_compile')
+    
+    gdf_merged = gdf_bdtopo.merge(df_bdnb_links, on='rnb_id', how='left')
+    gdf_merged = gdf_merged.merge(df_construction.drop_duplicates(subset=['batiment_construction_id']), on='batiment_construction_id', how='left')
 
-    initial_bat_count = len(gdf_bat)
-    print(f"Filtrage des bâtiments : {initial_bat_count} trouvés initialement.")
+    features_to_keep = ['batiment_groupe_id', 'ffo_bat_annee_construction', 'bdtopo_bat_l_usage_1', 'ffo_bat_nb_log']
+    df_groupe_subset = df_groupe_compile[features_to_keep].drop_duplicates(subset=['batiment_groupe_id'])
+    gdf_bat_golden = gdf_merged.merge(df_groupe_subset, on='batiment_groupe_id', how='left')
 
-    gdf_bat.geometry = gdf_bat.geometry.force_2d()
-    gdf_bat = gdf_bat[gdf_bat.within(departement_boundary)]
-    
-    filtered_bat_count = len(gdf_bat)
-    print(f"Bâtiments conservés après filtrage : {filtered_bat_count} ({initial_bat_count - filtered_bat_count} supprimés).\n")
-    
-    # Assurer que les colonnes ID existent et sont renommées
-    gdf_adr = gdf_adr.rename(columns={'id': 'id_adr'}).assign(id_adr=lambda x: x['id_adr'].astype(str))
-    
-    # Bâtiments : Créer ID et features numériques (hauteur/surface)
-    
-    gdf_bat = gdf_bat.reset_index().rename(columns={'index': 'id_bat_idx'}).assign(
-        id_bat=lambda x: 'BAT_' + x['id_bat_idx'].astype(str),
-        surface=lambda x: x.geometry.area
-    ).drop(columns=['id_bat_idx'])
-    
-    # Parcelles : Forcer la superficie à être numérique et gérer les ID
-    gdf_par = gdf_par.rename(columns={'id': 'id_par'}).assign(
-        id_par=lambda x: x['id_par'].astype(str),
-        superficie=lambda x: pd.to_numeric(x.geometry.area, errors='coerce').fillna(0.0)
-    )
+    print("Chargement et enrichissement des données parcellaires avec le PLU...")
+    gdf_parcelles = gpd.read_file(PARCEL_PATH).to_crs(TARGET_CRS)
+    gdf_parcelles.rename(columns={'id': 'parcelle_id'}, inplace=True)
 
-    gdf_par = gdf_par[['id_par','superficie','geometry']].copy()
-    gdf_bat = gdf_bat[['id_bat','surface','hauteur','geometry']].copy()
-    gdf_adr = gdf_adr.assign(x=lambda df: df.geometry.x, y=lambda df: df.geometry.y)[['id_adr','x','y','geometry']].copy()
+    doc_urba = gpd.read_file(PLU_PATH, layer='zone_urba')
+    gdf_parcelles_final = perform_semantic_sjoin(gdf_parcelles, doc_urba)
+    
+    # Imputation des valeurs PLU manquantes
+    gdf_parcelles_final['LIBELLE'] = gdf_parcelles_final['LIBELLE'].fillna('HP')
+    gdf_parcelles_final['LIBELLE'] = gdf_parcelles_final['LIBELLE'].str[:2]
+    gdf_parcelles_final['TYPEZONE'] = gdf_parcelles_final['TYPEZONE'].fillna('HP')
+    
+    
+    gdf_ban_csv = pd.read_csv(BAN_PATH, sep=';', dtype=str)
+    gdf_ban = gpd.GeoDataFrame(gdf_ban_csv, geometry=gpd.points_from_xy(pd.to_numeric(gdf_ban_csv.lon), pd.to_numeric(gdf_ban_csv.lat)), crs="EPSG:4326").to_crs(TARGET_CRS)
+    gdf_ban.rename(columns={'id': 'ban_id'}, inplace=True)
 
-    # 1.3. Encodage PLU & Normalisation
-    # (Le code d'encodage et de normalisation reste identique)
-    doc_urba = gpd.read_file("data/wfs_du.gpkg",layer='zone_urba')
-    doc_urba = doc_urba.to_crs(TARGET_CRS)
-    gdf_par = perform_semantic_sjoin(gdf_par, doc_urba)
-    gdf_par['LIBELLE'] = gdf_par['LIBELLE'].fillna('HORS_PLU')
-    gdf_par['TYPEZONE'] = gdf_par['TYPEZONE'].fillna('HORS_PLU')
-    df_plu_encoded = pd.get_dummies(gdf_par[['LIBELLE', 'TYPEZONE']], prefix=['PLU_LIBELLE', 'TYPEZONE'])
+    print("Golden Datasets créés.")
+    return gdf_bat_golden, gdf_parcelles_final, gdf_ban, df_ban_links, df_parcelle_links
 
-    gdf_adr = normalize_features(gdf_adr, ['x', 'y']) 
-    gdf_bat = normalize_features(gdf_bat, ['hauteur', 'surface'])
-    gdf_par = normalize_features(gdf_par, ['superficie'])
-    
-    par_features_base = gdf_par[['superficie']].values
-    par_features = np.hstack([par_features_base, df_plu_encoded.values])
-    
-    # 1.4. Création des Relations (Arêtes)
-    sjoin_bp_id = gpd.sjoin(gdf_bat[['id_bat', 'geometry']], gdf_par[['id_par', 'geometry']], how='left', predicate='intersects', lsuffix='bat', rsuffix='par')
-    edge_index_bp_df = sjoin_bp_id[['id_bat', 'id_par']].dropna().reset_index(drop=True)
-    edge_index_bp_df['intersection_perc'] = 1.0 
-    
-    print("Calcul de la relation Adresse -> Bâtiment (sjoin_nearest)...")
-    MAX_DISTANCE_METERS = 100 
-    sjoin_ab = gpd.sjoin_nearest(
-        gdf_adr, 
-        gdf_bat[['id_bat', 'geometry']], 
-        how='left', 
-        max_distance=MAX_DISTANCE_METERS, 
-    )
-    edge_index_ab_df = sjoin_ab[['id_adr', 'id_bat']].dropna().reset_index(drop=True)
 
-    # 1.5. Conversion Finale pour PyTorch
-    adr_map = {id: i for i, id in enumerate(gdf_adr['id_adr'].unique())}
-    bat_map = {id: i for i, id in enumerate(gdf_bat['id_bat'].unique())}
-    par_map = {id: i for i, id in enumerate(gdf_par['id_par'].unique())}
-    
-    edge_index_bp_df['bat_src_idx'] = edge_index_bp_df['id_bat'].map(bat_map)
-    edge_index_bp_df['par_dst_idx'] = edge_index_bp_df['id_par'].map(par_map)
-    edge_index_ab_df['adr_src_idx'] = edge_index_ab_df['id_adr'].map(adr_map)
-    edge_index_ab_df['bat_dst_idx'] = edge_index_ab_df['id_bat'].map(bat_map)
+def prepare_node_features(gdf_bat, gdf_par, gdf_ban):
+    """Prépare les tenseurs de features pour chaque type de nœud."""
+    print("\nPréparation des features des nœuds...")
+    scaler = MinMaxScaler()
 
-    edge_index_bp_df.dropna(subset=['bat_src_idx', 'par_dst_idx'], inplace=True)
-    edge_index_ab_df.dropna(subset=['adr_src_idx', 'bat_dst_idx'], inplace=True)
+    # Bâtiments
+    bat_features = gdf_bat[['rnb_id', 'geometry', 'ffo_bat_annee_construction', 'bdtopo_bat_l_usage_1', 'ffo_bat_nb_log']].copy()
+    median_year = pd.to_numeric(bat_features['ffo_bat_annee_construction'], errors='coerce').median()
+    median_logs = pd.to_numeric(bat_features['ffo_bat_nb_log'], errors='coerce').median()
+    bat_features['ffo_bat_annee_construction'] = pd.to_numeric(bat_features['ffo_bat_annee_construction'], errors='coerce').fillna(median_year)
+    print("  - Binning de l'année de construction en décennies...")
+    year_bins = list(range(1800, 2031, 10)) # Crée des classes de 10 ans de 1800 à 2030
+    year_labels = [f"decennie_{i}" for i in range(1800, 2021, 10)]
+    bat_features['decennie_construction'] = pd.cut(bat_features['ffo_bat_annee_construction'], bins=year_bins, labels=year_labels, right=False)
+    bat_features['decennie_construction'] = bat_features['decennie_construction'].cat.add_categories("Inconnu").fillna("Inconnu")
+    bat_features['ffo_bat_nb_log'] = pd.to_numeric(bat_features['ffo_bat_nb_log'], errors='coerce').fillna(median_logs)
+    bat_features['bdtopo_bat_l_usage_1'] = bat_features['bdtopo_bat_l_usage_1'].fillna("Inconnu")
+    bat_features['surface'] = bat_features.geometry.area
+    categorical_feats = ['bdtopo_bat_l_usage_1', 'decennie_construction']
+    one_hot_encoded = pd.get_dummies(bat_features[categorical_feats], prefix=['usage', 'decennie'], dtype=int)
+    numerical_feats = ['surface', 'ffo_bat_nb_log']
+    scaled_numerical = scaler.fit_transform(bat_features[numerical_feats])
+    scaled_numerical_df = pd.DataFrame(scaled_numerical, columns=numerical_feats, index=bat_features.index)
+    
+    final_bat_features_df = pd.concat([scaled_numerical_df, one_hot_encoded], axis=1)
+    bat_x = torch.tensor(final_bat_features_df.values, dtype=torch.float)
 
-    edge_index_bp_df = edge_index_bp_df.astype({'bat_src_idx': np.int64, 'par_dst_idx': np.int64})
-    edge_index_ab_df = edge_index_ab_df.astype({'adr_src_idx': np.int64, 'bat_dst_idx': np.int64})
+    # Parcelles
+    gdf_par['superficie'] = gdf_par.geometry.area
+    
+    # Encodage One-Hot des features PLU
+    plu_categorical_feats = ['LIBELLE', 'TYPEZONE']
+    one_hot_encoded_plu = pd.get_dummies(gdf_par[plu_categorical_feats], prefix='plu', dtype=int)
+    
+    # Normalisation de la superficie
+    scaled_superficie = scaler.fit_transform(gdf_par[['superficie']])
+    scaled_superficie_df = pd.DataFrame(scaled_superficie, columns=['superficie'], index=gdf_par.index)
 
-    edge_index_bp = torch.tensor(edge_index_bp_df[['bat_src_idx', 'par_dst_idx']].values.T, dtype=torch.long)
-    edge_index_ab = torch.tensor(edge_index_ab_df[['adr_src_idx', 'bat_dst_idx']].values.T, dtype=torch.long)
-    
-    # --- MODIFICATION : Création de la relation inverse ---
-    # ('bâtiment', 'dessert', 'adresse') pour que les nœuds 'adresse' reçoivent des messages.
-    print("Création de la relation inverse Bâtiment -> Adresse...")
-    edge_index_ba = edge_index_ab.flip(0)
-    # --- FIN DE LA MODIFICATION ---
-    
-    edge_attr_bp = torch.tensor(edge_index_bp_df['intersection_perc'].values, dtype=torch.float).unsqueeze(1)
-    
-    adr_x = torch.tensor(gdf_adr[['x', 'y']].values.astype(np.float32), dtype=torch.float)
-    bat_x = torch.tensor(gdf_bat[['hauteur', 'surface']].values.astype(np.float32), dtype=torch.float)
-    par_x = torch.tensor(par_features, dtype=torch.float)
-    
-    # --- MODIFICATION : Ajout de edge_index_ba dans le retour de la fonction ---
-    return gdf_bat, adr_x, bat_x, par_x, edge_index_bp, edge_attr_bp, edge_index_ab, edge_index_ba, bat_map, par_map, adr_map
+    # Concaténation et création du tenseur final pour les parcelles
+    final_par_features_df = pd.concat([scaled_superficie_df, one_hot_encoded_plu], axis=1)
+    par_x = torch.tensor(final_par_features_df.values, dtype=torch.float)
 
-# --- FONCTION DE CLUSTERING ---
+
+    # Adresses
+    gdf_ban['x'] = gdf_ban.geometry.x; gdf_ban['y'] = gdf_ban.geometry.y
+    gdf_ban[['x', 'y']] = scaler.fit_transform(gdf_ban[['x', 'y']])
+    ban_x = torch.tensor(gdf_ban[['x', 'y']].values, dtype=torch.float)
+    
+    return bat_x, par_x, ban_x
+
+def build_graph_from_golden_datasets(gdf_bat, gdf_par, gdf_ban, df_ban_links, df_parcelle_links):
+    print("\n--- Étape 2 : Construction du Graphe ---")
+    bat_x, par_x, ban_x = prepare_node_features(gdf_bat, gdf_par, gdf_ban)
+
+    bat_map = {id: i for i, id in enumerate(gdf_bat['rnb_id'])}
+    par_map = {id: i for i, id in enumerate(gdf_par['parcelle_id'])}
+    ban_map = {id: i for i, id in enumerate(gdf_ban['ban_id'])}
+
+    # Lien Bâtiment <-> Parcelle (logique correcte)
+    bp_links = df_parcelle_links.copy()
+    bp_links['bat_idx'] = bp_links['rnb_id'].map(bat_map)
+    bp_links['par_idx'] = bp_links['parcelle_id'].map(par_map)
+    bp_links.dropna(subset=['bat_idx', 'par_idx'], inplace=True)
+    edge_index_bp = torch.tensor(bp_links[['bat_idx', 'par_idx']].values.T, dtype=torch.long)
+    cover_ratio_tensor = torch.tensor(bp_links['cover_ratio'].values, dtype=torch.float).unsqueeze(1)
+    padding_bp = torch.zeros(cover_ratio_tensor.shape[0], 1)
+    edge_attr_bp = torch.cat([cover_ratio_tensor, padding_bp], dim=1)
+
+    # Lien Adresse <-> Bâtiment (Hybride)
+    print("Création des liens Adresse-Bâtiment (Sémantique + Fallback Géométrique)...")
+
+    # A. Combinaison des liens
+    links_semantic = df_ban_links.copy(); links_semantic['link_type'] = 'semantic'
+    bat_linked = links_semantic['rnb_id'].unique(); ban_linked = links_semantic['ban_id'].unique()
+    gdf_bat_orphans = gdf_bat[~gdf_bat['rnb_id'].isin(bat_linked)]
+    gdf_ban_orphans = gdf_ban[~gdf_ban['ban_id'].isin(ban_linked)]
+    links_geometric = pd.DataFrame()
+    if not gdf_bat_orphans.empty and not gdf_ban_orphans.empty:
+        sjoin_geo = gpd.sjoin_nearest(gdf_ban_orphans[['ban_id', 'geometry']], gdf_bat_orphans[['rnb_id', 'geometry']], how='inner', max_distance=50)
+        links_geometric = sjoin_geo[['ban_id', 'rnb_id']].dropna(); links_geometric['link_type'] = 'geometric'
+
+    all_address_links = pd.concat([links_semantic, links_geometric], ignore_index=True).drop_duplicates(subset=['rnb_id', 'ban_id'])
+
+    # B. Mapping et FILTRAGE pour créer un DataFrame final et stable
+    all_address_links['adr_idx'] = all_address_links['ban_id'].map(ban_map)
+    all_address_links['bat_idx'] = all_address_links['rnb_id'].map(bat_map)
+    
+    # On crée un nouveau DataFrame propre et on réinitialise son index
+    final_address_links = all_address_links.dropna(subset=['adr_idx', 'bat_idx']).reset_index(drop=True)
+
+    # C. Création des DEUX tenseurs à partir de ce DataFrame final et synchronisé
+    link_type_dummies = pd.get_dummies(final_address_links['link_type'])
+    for col in ['semantic', 'geometric']:
+        if col not in link_type_dummies: link_type_dummies[col] = 0
+    
+    edge_attr_ab = torch.tensor(link_type_dummies[['semantic', 'geometric']].values, dtype=torch.float)
+    edge_index_ab = torch.tensor(final_address_links[['adr_idx', 'bat_idx']].values.T, dtype=torch.long)
+    # --- FIN DE LA CORRECTION DÉFINITIVE ---
+
+    # Assemblage final
+    data = HeteroData()
+    data['bâtiment'].x = bat_x; data['parcelle'].x = par_x; data['adresse'].x = ban_x
+    data['bâtiment', 'appartient', 'parcelle'].edge_index = edge_index_bp; data['bâtiment', 'appartient', 'parcelle'].edge_attr = edge_attr_bp
+    data['parcelle', 'contient', 'bâtiment'].edge_index = edge_index_bp.flip(0); data['parcelle', 'contient', 'bâtiment'].edge_attr = edge_attr_bp
+    data['adresse', 'accès', 'bâtiment'].edge_index = edge_index_ab; data['adresse', 'accès', 'bâtiment'].edge_attr = edge_attr_ab
+    data['bâtiment', 'desservi_par', 'adresse'].edge_index = edge_index_ab.flip(0); data['bâtiment', 'desservi_par', 'adresse'].edge_attr = edge_attr_ab
+
+    print("Graphe final construit.")
+    return data, bat_map
 
 def perform_hdbscan_clustering(embeddings_tensor, node_map):
-    """
-    Effectue un clustering de Louvain sur les embeddings en construisant un graphe
-    k-NN pour éviter les problèmes de surcharge mémoire.
-    """
-    # Paramètre clé : le nombre de voisins à considérer pour chaque nœud.
-    # 10 est un bon point de départ.
-    MIN_CLUSTER_SIZE = 5
-    
-    print(f"Lancement du clustering HDBSCAN (min_cluster_size={MIN_CLUSTER_SIZE})...")
-
-    # Convertir le tenseur en array numpy
+    """Effectue le clustering sémantique avec HDBSCAN."""
+    print("\n--- 4. Détection de Communautés Sémantiques (HDBSCAN) ---")
     embeddings_np = embeddings_tensor.cpu().numpy()
-    # 1. Normalisation L2 des embeddings
-    # Chaque vecteur aura maintenant une longueur de 1.
-    print("Normalisation L2 des embeddings pour compatibilité avec les algorithmes rapides...")
     embeddings_normalized = normalize(embeddings_np, norm='l2', axis=1)
     
-    # 2. Initialiser et entraîner le modèle HDBSCAN
-    clusterer = hdbscan.HDBSCAN(
-        min_cluster_size=MIN_CLUSTER_SIZE,
-        metric='euclidean',
-        algorithm='best',
-        core_dist_n_jobs=-1 # Utilise tous les cœurs CPU pour accélérer
-    )
-    
-    # .fit_predict() est un raccourci pour entraîner et obtenir les labels
+    clusterer = hdbscan.HDBSCAN(min_cluster_size=5, min_samples=2, metric='euclidean', algorithm='best', core_dist_n_jobs=-1)
     labels = clusterer.fit_predict(embeddings_normalized)
     
-    # 2. Formater les résultats dans un DataFrame
-    print("Formatage des résultats...")
-    # Le label -1 correspond aux points considérés comme du "bruit" (non clusterisés)
     num_clusters = len(set(labels)) - (1 if -1 in labels else 0)
-    num_noise = np.sum(labels == -1)
-    print(f"Détection terminée : {num_clusters} clusters trouvés, avec {num_noise} bâtiments considérés comme du bruit.")
+    print(f"Détection sémantique terminée : {num_clusters} clusters trouvés.")
 
     inv_node_map = {v: k for k, v in node_map.items()}
-    
-    results = []
-    # L'index de `labels` correspond à l'index numérique des nœuds
-    for node_idx, community_id in enumerate(labels):
-        node_real_id = inv_node_map.get(node_idx)
-        if node_real_id is not None:
-            results.append({'id_bat': node_real_id, 'community': community_id})
-            
+    results = [{'id_bat': inv_node_map.get(node_idx), 'community': community_id}
+               for node_idx, community_id in enumerate(labels) if inv_node_map.get(node_idx) is not None]
     return pd.DataFrame(results)
 
-def perform_geographic_subclustering(gdf_bat, communities_df):
-    """
-    Post-traite les clusters sémantiques en les subdivisant géographiquement.
-    Pour chaque cluster sémantique, lance un DBSCAN géographique pour trouver les
-    sous-groupes de bâtiments contigus.
-    """
-    print("Lancement du post-traitement : sous-clustering géographique...")
-    
-    # Fusionner les résultats du clustering sémantique avec les données géographiques
-    gdf_merged = gdf_bat.merge(communities_df, on='id_bat')
-    
-    final_clusters = []
-    
-    # Traiter chaque cluster sémantique un par un (sauf le bruit)
-    semantic_clusters = gdf_merged[gdf_merged['community'] != -1]['community'].unique()
+def perform_geographic_subclustering(gdf_par, building_parcel_links, communities_df):
+    """Effectue le sous-clustering géographique par contiguïté des parcelles."""
+    print("\n--- 5. Post-traitement : Sous-clustering par Contiguïté Parcellaire ---")
+    final_assignments = []
+    semantic_clusters = communities_df[communities_df['community'] != -1]['community'].unique()
     
     for semantic_id in semantic_clusters:
-        gdf_semantic_cluster = gdf_merged[gdf_merged['community'] == semantic_id].copy()
+        buildings_in_cluster = communities_df[communities_df['community'] == semantic_id]['id_bat']
+        parcels_for_buildings = building_parcel_links[building_parcel_links['rnb_id'].isin(buildings_in_cluster)]
+        unique_parcel_ids = parcels_for_buildings['parcelle_id'].unique()
+        gdf_par_subset = gdf_par[gdf_par['parcelle_id'].isin(unique_parcel_ids)].copy()
         
-        # Extraire les coordonnées pour DBSCAN
-        coords = np.array(list(zip(gdf_semantic_cluster.geometry.x, gdf_semantic_cluster.geometry.y)))
+        if len(gdf_par_subset) < 2:
+            assignments = pd.DataFrame({'id_bat': buildings_in_cluster, 'final_community': f"{semantic_id}_0"})
+            final_assignments.append(assignments); continue
+            
+        G = nx.Graph()
+        G.add_nodes_from(unique_parcel_ids)
+        touching_parcels = gpd.sjoin(gdf_par_subset, gdf_par_subset, how="inner", predicate="intersects")
+        for _, row in touching_parcels.iterrows():
+            if row['parcelle_id_left'] != row['parcelle_id_right']:
+                G.add_edge(row['parcelle_id_left'], row['parcelle_id_right'])
         
-        # DBSCAN a deux paramètres clés :
-        # eps: La distance maximale entre deux points pour qu'ils soient considérés comme voisins.
-        #      Une valeur entre 25 et 50 mètres est un bon début pour des bâtiments.
-        # min_samples: Le nombre minimum de points pour former un noyau de cluster dense.
-        #      On peut le lier à notre `min_cluster_size` sémantique.
-        dbscan = DBSCAN(eps=35, min_samples=5) # 35 mètres
+        parcel_blocks = list(nx.connected_components(G))
+        parcel_to_block_map = {parcel_id: f"{semantic_id}_{block_id}" for block_id, block in enumerate(parcel_blocks) for parcel_id in block}
         
-        geo_labels = dbscan.fit_predict(coords)
-        
-        gdf_semantic_cluster['geographic_subcluster'] = geo_labels
-        
-        # Créer un ID de cluster final unique (ex: "0_1", "0_2", "1_1", etc.)
-        # Le bruit géographique (-1) est assigné à un sous-cluster spécial.
-        gdf_semantic_cluster['final_community'] = gdf_semantic_cluster.apply(
-            lambda row: f"{row['community']}_{row['geographic_subcluster']}" if row['geographic_subcluster'] != -1 else f"{row['community']}_noise",
-            axis=1
-        )
-        
-        final_clusters.append(gdf_semantic_cluster)
+        assignments = parcels_for_buildings.rename(columns={'rnb_id': 'id_bat'}).copy()
+        assignments['final_community'] = assignments['parcelle_id'].map(parcel_to_block_map)
+        final_assignments.append(assignments[['id_bat', 'final_community']].drop_duplicates(subset=['id_bat']))
 
-    # Gérer les bâtiments initialement classés comme bruit
-    noise_gdf = gdf_merged[gdf_merged['community'] == -1].copy()
-    if not noise_gdf.empty:
-        noise_gdf['final_community'] = '-1_noise'
-        final_clusters.append(noise_gdf)
+    noise_df = communities_df[communities_df['community'] == -1].copy()
+    if not noise_df.empty:
+        noise_df['final_community'] = '-1_noise'
+        final_assignments.append(noise_df[['id_bat', 'final_community']])
         
-    if not final_clusters:
-        print("Avertissement : Aucun cluster final n'a été formé.")
-        return pd.DataFrame()
-
-    # Concaténer tous les résultats
-    final_df = pd.concat(final_clusters, ignore_index=True)
-    
-    return final_df[['id_bat', 'final_community']]
+    if not final_assignments: return pd.DataFrame(columns=['id_bat', 'final_community'])
+    return pd.concat(final_assignments, ignore_index=True)
