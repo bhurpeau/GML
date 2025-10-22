@@ -32,7 +32,7 @@ def prune_columns(heads, criterion, usage, gates, min_usage=2e-3, min_gate=0.10,
         # compress layer weights
         if mask.sum() < LMN:
             with torch.no_grad():
-                W = head_layer.weight.data[:, mask]        # [out, newK] (out = dim embedding)
+                W = head_layer.weight.data[:, mask]        
                 head_layer.weight = torch.nn.Parameter(W)
                 if head_layer.bias is not None:
                     head_layer.bias = torch.nn.Parameter(head_layer.bias.data)

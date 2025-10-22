@@ -78,7 +78,7 @@ def main():
         out_channels=args.emb_dim,
         num_layers=2,
         node_feature_sizes=node_feature_sizes,
-        edge_feature_size=None
+        edge_feature_size=2
     ).to(device)
 
     heads = TripletHeads(dim=args.emb_dim, L=args.L, M=args.M, N=args.N).to(device)
