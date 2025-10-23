@@ -85,7 +85,7 @@ def train_dmon3p(
     prune_every: int = 10, min_usage: float = 2e-3, min_gate: float = 0.10,
     prune_delay_epoch: int = 50,         # ne pas pruner avant cette époque
     m_chunk: int = 256, use_amp: bool = True,
-    trial = None                         # Optuna Trial optionnel
+    trial=None                         # Optuna Trial optionnel
 ):
     # Init paramètres du critère
     criterion.beta = schedule_beta[0]
@@ -96,7 +96,8 @@ def train_dmon3p(
     best_Q = float("-inf")
 
     for epoch in range(1, epochs + 1):
-        model.train(); heads.train()
+        model.train()
+        heads.train()
         optimizer.zero_grad(set_to_none=True)
 
         # Prépare batch complet (tu peux mettre un loader si besoin)
@@ -181,7 +182,8 @@ def train_dmon3p(
     # ----------------------
     # Inférence "soft" finale
     # ----------------------
-    model.eval(); heads.eval()
+    model.eval()
+    heads.eval()
     with torch.no_grad():
         x_dict = {k: v.to(device) for k, v in data.x_dict.items()}
         edge_index_dict = {k: v.to(device) for k, v in data.edge_index_dict.items()}
@@ -190,11 +192,9 @@ def train_dmon3p(
             ea = getattr(data[rel], 'edge_attr', None)
             edge_attr_dict[rel] = ea.to(device) if ea is not None else None
 
-        # IMPORTANT: repasser par la tête complète (gates + pruning pris en compte)
+        h_dict = model(x_dict, edge_index_dict, edge_attr_dict)
         Sx_logits, Sy_logits, Sz_logits, _ = heads(
-            model(x_dict, edge_index_dict, edge_attr_dict)['adresse'],
-            model(x_dict, edge_index_dict, edge_attr_dict)['bâtiment'],
-            model(x_dict, edge_index_dict, edge_attr_dict)['parcelle'],
+            h_dict['adresse'], h_dict['bâtiment'], h_dict['parcelle']
         )
         Sy = torch.softmax(Sy_logits, dim=1).cpu()
 

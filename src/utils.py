@@ -31,20 +31,23 @@ def parse_rnb_links(df_rnb):
                 for addr in ast.literal_eval(row['addresses']):
                     if 'cle_interop_ban' in addr:
                         links['ban'].append({'rnb_id': rnb_id, 'ban_id': addr['cle_interop_ban']})
-            except (ValueError, SyntaxError): pass
+            except (ValueError, SyntaxError):
+                pass
         if isinstance(row['plots'], str):
             try:
                 for plot in ast.literal_eval(row['plots']):
                     if 'id' in plot:
                         ratio = plot.get('bdg_cover_ratio', 0.0)
                         links['parcelle'].append({'rnb_id': rnb_id, 'parcelle_id': plot['id'], 'cover_ratio': float(ratio)})
-            except (ValueError, SyntaxError): pass
+            except (ValueError, SyntaxError):
+                pass
         if isinstance(row['ext_ids'], str):
             try:
                 for ext_id in ast.literal_eval(row['ext_ids']):
                     if ext_id.get('source') == 'bdnb':
                         links['bdnb'].append({'rnb_id': rnb_id, 'batiment_construction_id': ext_id['id']})
-            except (ValueError, SyntaxError): pass
+            except (ValueError, SyntaxError):
+                pass
     return pd.DataFrame(links['ban']).drop_duplicates(), pd.DataFrame(links['parcelle']), pd.DataFrame(links['bdnb']).drop_duplicates()
 
 
@@ -170,7 +173,8 @@ def prepare_node_features(gdf_bat, gdf_par, gdf_ban):
     par_x = torch.tensor(final_par_features_df.values, dtype=torch.float)
 
     # Adresses
-    gdf_ban['x'] = gdf_ban.geometry.x; gdf_ban['y'] = gdf_ban.geometry.y
+    gdf_ban['x'] = gdf_ban.geometry.x
+    gdf_ban['y'] = gdf_ban.geometry.y
     gdf_ban[['x', 'y']] = scaler.fit_transform(gdf_ban[['x', 'y']])
     ban_x = torch.tensor(gdf_ban[['x', 'y']].values, dtype=torch.float)
 
@@ -199,14 +203,17 @@ def build_graph_from_golden_datasets(gdf_bat, gdf_par, gdf_ban, df_ban_links, df
     print("Création des liens Adresse-Bâtiment (Sémantique + Fallback Géométrique)...")
 
     # A. Combinaison des liens
-    links_semantic = df_ban_links.copy(); links_semantic['link_type'] = 'semantic'
-    bat_linked = links_semantic['rnb_id'].unique(); ban_linked = links_semantic['ban_id'].unique()
+    links_semantic = df_ban_links.copy()
+    links_semantic['link_type'] = 'semantic'
+    bat_linked = links_semantic['rnb_id'].unique()
+    ban_linked = links_semantic['ban_id'].unique()
     gdf_bat_orphans = gdf_bat[~gdf_bat['rnb_id'].isin(bat_linked)]
     gdf_ban_orphans = gdf_ban[~gdf_ban['ban_id'].isin(ban_linked)]
     links_geometric = pd.DataFrame()
     if not gdf_bat_orphans.empty and not gdf_ban_orphans.empty:
         sjoin_geo = gpd.sjoin_nearest(gdf_ban_orphans[['ban_id', 'geometry']], gdf_bat_orphans[['rnb_id', 'geometry']], how='inner', max_distance=50)
-        links_geometric = sjoin_geo[['ban_id', 'rnb_id']].dropna(); links_geometric['link_type'] = 'geometric'
+        links_geometric = sjoin_geo[['ban_id', 'rnb_id']].dropna()
+        links_geometric['link_type'] = 'geometric'
 
     all_address_links = pd.concat([links_semantic, links_geometric], ignore_index=True).drop_duplicates(subset=['rnb_id', 'ban_id'])
 
@@ -220,7 +227,8 @@ def build_graph_from_golden_datasets(gdf_bat, gdf_par, gdf_ban, df_ban_links, df
     # C. Création des DEUX tenseurs à partir de ce DataFrame final et synchronisé
     link_type_dummies = pd.get_dummies(final_address_links['link_type'])
     for col in ['semantic', 'geometric']:
-        if col not in link_type_dummies: link_type_dummies[col] = 0
+        if col not in link_type_dummies:
+            link_type_dummies[col] = 0
 
     edge_attr_ab = torch.tensor(link_type_dummies[['semantic', 'geometric']].values, dtype=torch.float)
     edge_index_ab = torch.tensor(final_address_links[['adr_idx', 'bat_idx']].values.T, dtype=torch.long)
@@ -228,11 +236,17 @@ def build_graph_from_golden_datasets(gdf_bat, gdf_par, gdf_ban, df_ban_links, df
 
     # Assemblage final
     data = HeteroData()
-    data['bâtiment'].x = bat_x; data['parcelle'].x = par_x; data['adresse'].x = ban_x
-    data['bâtiment', 'appartient', 'parcelle'].edge_index = edge_index_bp; data['bâtiment', 'appartient', 'parcelle'].edge_attr = edge_attr_bp
-    data['parcelle', 'contient', 'bâtiment'].edge_index = edge_index_bp.flip(0); data['parcelle', 'contient', 'bâtiment'].edge_attr = edge_attr_bp
-    data['adresse', 'accès', 'bâtiment'].edge_index = edge_index_ab; data['adresse', 'accès', 'bâtiment'].edge_attr = edge_attr_ab
-    data['bâtiment', 'desservi_par', 'adresse'].edge_index = edge_index_ab.flip(0); data['bâtiment', 'desservi_par', 'adresse'].edge_attr = edge_attr_ab
+    data['bâtiment'].x = bat_x
+    data['parcelle'].x = par_x
+    data['adresse'].x = ban_x
+    data['bâtiment', 'appartient', 'parcelle'].edge_index = edge_index_bp
+    data['bâtiment', 'appartient', 'parcelle'].edge_attr = edge_attr_bp
+    data['parcelle', 'contient', 'bâtiment'].edge_index = edge_index_bp.flip(0)
+    data['parcelle', 'contient', 'bâtiment'].edge_attr = edge_attr_bp
+    data['adresse', 'accès', 'bâtiment'].edge_index = edge_index_ab
+    data['adresse', 'accès', 'bâtiment'].edge_attr = edge_attr_ab
+    data['bâtiment', 'desservi_par', 'adresse'].edge_index = edge_index_ab.flip(0)
+    data['bâtiment', 'desservi_par', 'adresse'].edge_attr = edge_attr_ab
 
     print("Graphe final construit.")
     return data, bat_map
@@ -270,7 +284,8 @@ def perform_geographic_subclustering(gdf_par, building_parcel_links, communities
 
         if len(gdf_par_subset) < 2:
             assignments = pd.DataFrame({'id_bat': buildings_in_cluster, 'final_community': f"{semantic_id}_0"})
-            final_assignments.append(assignments); continue
+            final_assignments.append(assignments)
+            continue
 
         G = nx.Graph()
         G.add_nodes_from(unique_parcel_ids)
@@ -291,5 +306,6 @@ def perform_geographic_subclustering(gdf_par, building_parcel_links, communities
         noise_df['final_community'] = '-1_noise'
         final_assignments.append(noise_df[['id_bat', 'final_community']])
 
-    if not final_assignments: return pd.DataFrame(columns=['id_bat', 'final_community'])
+    if not final_assignments:
+        return pd.DataFrame(columns=['id_bat', 'final_community'])
     return pd.concat(final_assignments, ignore_index=True)

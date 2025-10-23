@@ -109,8 +109,10 @@ def main():
     edge_index_YZ = data[YZ_KEY].edge_index.to(device)
     w_XY = maybe_pick_scalar_weight(getattr(data[XY_KEY], 'edge_attr', None))
     w_YZ = maybe_pick_scalar_weight(getattr(data[YZ_KEY], 'edge_attr', None))
-    if w_XY is not None: w_XY = w_XY.to(device)
-    if w_YZ is not None: w_YZ = w_YZ.to(device)
+    if w_XY is not None:
+        w_XY = w_XY.to(device)
+    if w_YZ is not None:
+        w_YZ = w_YZ.to(device)
 
     # === Entraînement complet via train_loop ===
     print("=== Entraînement DMoN-3p (avec pruning, annealing et AMP) ===")
@@ -147,7 +149,6 @@ def main():
         h_dict['adresse'], h_dict['bâtiment'], h_dict['parcelle']
         )
         Sy = softmax(Sy_logits, dim=1).cpu()
-        yY = Sy.argmax(dim=1).numpy()
     import numpy as np
     hard = Sy.argmax(dim=1).numpy()
     uniq, cnt = np.unique(hard, return_counts=True)
@@ -155,7 +156,7 @@ def main():
     print("Nb clusters utilisés (Y):", len(uniq))
     print("Gates Y (min/med/max):", float(gY.min()), float(gY.median()), float(gY.max()))
     print("Usage moyen par colonne (Y):", Sy.mean(dim=0).numpy())
-  
+
     # Export des communautés de bâtiments (compatibles avec ton ancien export)
     inv_bat_map = {v: k for k, v in bat_map.items()}
     ids_bat = [inv_bat_map.get(i, f"unk_{i}") for i in range(len(hard))]

@@ -10,8 +10,8 @@ import argparse
 import numpy as np
 import torch
 import optuna
+import traceback
 
-# --- ton code local ---
 from src.train_tripartite import train_dmon3p
 from src.dmon3p import DMoN3P
 from src.heads import TripletHeads
@@ -52,8 +52,10 @@ def load_data(device):
     edge_index_YZ = data[YZ_KEY].edge_index.to(device)
     w_XY = maybe_pick_scalar_weight(getattr(data[XY_KEY], 'edge_attr', None))
     w_YZ = maybe_pick_scalar_weight(getattr(data[YZ_KEY], 'edge_attr', None))
-    if w_XY is not None: w_XY = w_XY.to(device)
-    if w_YZ is not None: w_YZ = w_YZ.to(device)
+    if w_XY is not None:
+        w_XY = w_XY.to(device)
+    if w_YZ is not None:
+        w_YZ = w_YZ.to(device)
 
     node_feature_sizes = {nt: data[nt].x.size(1) for nt in data.node_types}
     return data, bat_map, node_feature_sizes, (X, Y, Z), edge_index_XY, edge_index_YZ, w_XY, w_YZ
@@ -66,7 +68,7 @@ def build_model(data, node_feature_sizes, L, M, N, emb_dim, hidden, device):
         out_channels=emb_dim,
         num_layers=2,
         node_feature_sizes=node_feature_sizes,
-        edge_feature_size=None
+        edge_feature_size=2
     ).to(device)
 
     heads = TripletHeads(dim=emb_dim, L=L, M=M, N=N).to(device)
@@ -84,15 +86,15 @@ def objective(trial, cache, device, epochs):
 
     # --- espace de recherche ---
     lambda_collapse = trial.suggest_float("lambda_collapse", 0.05, 5.0, log=True)
-    entropy_weight  = trial.suggest_float("entropy_weight", 5e-4, 5e-3, log=True)
-    lam_g           = trial.suggest_float("lam_g", 1e-4, 2e-3, log=True)
+    entropy_weight = trial.suggest_float("entropy_weight", 5e-4, 5e-3, log=True)
+    lam_g = trial.suggest_float("lam_g", 1e-4, 2e-3, log=True)
 
-    beta_max        = trial.suggest_categorical("beta_max",  [4.0, 5.0, 6.0, 8.0])
-    gamma_max       = trial.suggest_categorical("gamma_max", [1.5, 2.0, 2.5, 3.0])
-    anneal_step     = trial.suggest_categorical("anneal_step", [5, 10])
+    beta_max = trial.suggest_categorical("beta_max",  [4.0, 5.0, 6.0, 8.0])
+    gamma_max = trial.suggest_categorical("gamma_max", [1.5, 2.0, 2.5, 3.0])
+    anneal_step = trial.suggest_categorical("anneal_step", [5, 10])
 
-    prune_delay_ep  = trial.suggest_categorical("prune_delay_epoch", [20, 40, 60, 80])
-    prune_every     = trial.suggest_categorical("prune_every", [10, 20])
+    prune_delay_ep = trial.suggest_categorical("prune_delay_epoch", [20, 40, 60, 80])
+    prune_every = trial.suggest_categorical("prune_every", [10, 20])
 
     # tailles fixes (tu peux aussi les explorer)
     L = M = N = 64
@@ -127,7 +129,7 @@ def objective(trial, cache, device, epochs):
             schedule_gamma=(1.0, gamma_max, anneal_step),
             anneal_delay_epoch=0,
             prune_every=prune_every, prune_delay_epoch=prune_delay_ep,
-            m_chunk=256, use_amp=True,
+            m_chunk=256, use_amp=False,
             trial=trial
         )
     except Exception as e:
@@ -135,6 +137,7 @@ def objective(trial, cache, device, epochs):
         if str(e) == "OPTUNA_PRUNE":
             raise optuna.TrialPruned()
         # tout autre crash → très mauvais score
+        traceback.print_exc()
         return -1e6
 
     Q_final = float(res["Q_final"])

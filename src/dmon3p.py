@@ -78,9 +78,9 @@ class DMoN3P(nn.Module):
         # E_XY[l,m], E_YZ[m,n]
         AY = (omega[:, None] * A)              # [Y,L]
         CY = (omega[:, None] * C)              # [Y,N]
-        E_XY = (AY.T @ S_Y) / Mnorm           # [L,M]
+        E_XY = (AY.T @ S_Y) / Mnorm          # [L,M]
         E_YZ = (S_Y.T @ CY) / Mnorm           # [M,N]
-        
+
         # soft-dominance
         alpha = F.softmax(self.beta * E_XY, dim=0)       # [L,M] over l
         gamma_soft = F.softmax(self.beta * E_YZ, dim=1)  # [M,N] over n
@@ -108,9 +108,7 @@ class DMoN3P(nn.Module):
         aZ = E_YZ.sum(dim=0)     # [N]
         termL = alpha.T @ aX     # [M]
         termR = gamma_soft @ aZ  # [M]
-        # Q_exp = (termL * aY * termR).sum()
         Q_exp = (termL * aY * termR).sum() / Mnorm
-
         # resolution gamma
         Q = Q_obs - self.gamma * Q_exp
 
