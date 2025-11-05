@@ -83,7 +83,7 @@ def train_dmon3p(
     schedule_gamma=(1.0, 2.0, 10),     # (start, max, step_epochs)
     anneal_delay_epoch: int = 0,         # ne pas annealer avant cette époque
     prune_every: int = 10, min_usage: float = 2e-3, min_gate: float = 0.10,
-    prune_delay_epoch: int = 50,         # ne pas pruner avant cette époque
+    prune_delay_epoch: int = 100,         # ne pas pruner avant cette époque
     m_chunk: int = 256, use_amp: bool = True,
     trial=None                         # Optuna Trial optionnel
 ):
@@ -135,7 +135,7 @@ def train_dmon3p(
         scaler.update()
 
         # Logs
-        if epoch == 1 or epoch % 5 == 0:
+        if epoch == 1 or epoch % 10 == 0:
             print(f"[{epoch:03d}] loss={float(loss):.4f}  Q={float(out['Q']):.4f}  "
                   f"(Q_obs={float(out['Q_obs']):.4f}  Q_exp={float(out['Q_exp']):.4f})  "
                   f"L/M/N={criterion.L}/{criterion.M}/{criterion.N}  "

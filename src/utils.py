@@ -190,32 +190,50 @@ def build_graph_from_golden_datasets(gdf_bat, gdf_par, gdf_ban, df_ban_links, df
     par_map = {id: i for i, id in enumerate(gdf_par['parcelle_id'])}
     ban_map = {id: i for i, id in enumerate(gdf_ban['ban_id'])}
 
-    # === 1. LIENS SÉMANTIQUES (POUR LA PERTE DMoN ET LE GNN) ===
-    
-    # Lien Bâtiment <-> Parcelle (Sémantique)
+    # Lien Bâtiment <-> Parcelle (logique correcte)
     bp_links = df_parcelle_links.copy()
     bp_links['bat_idx'] = bp_links['rnb_id'].map(bat_map)
     bp_links['par_idx'] = bp_links['parcelle_id'].map(par_map)
     bp_links.dropna(subset=['bat_idx', 'par_idx'], inplace=True)
-    # Assurez-vous que les indices sont bien des entiers
     edge_index_bp_semantic = torch.tensor(bp_links[['bat_idx', 'par_idx']].values.T, dtype=torch.long)
     cover_ratio_tensor = torch.tensor(bp_links['cover_ratio'].values, dtype=torch.float).unsqueeze(1)
     padding_bp = torch.zeros(cover_ratio_tensor.shape[0], 1)
     edge_attr_bp_semantic = torch.cat([cover_ratio_tensor, padding_bp], dim=1)
 
-    # Lien Adresse <-> Bâtiment (Sémantique)
-    # ... (Votre code hybride existant est correct) ...
+    # Lien Adresse <-> Bâtiment (Hybride)
     print("Création des liens Adresse-Bâtiment (Sémantique + Fallback Géométrique)...")
-    links_semantic = df_ban_links.copy(); links_semantic['link_type'] = 'semantic'
-    # ... (le reste de votre logique pour all_address_links) ...
+
+    # A. Combinaison des liens
+    links_semantic = df_ban_links.copy()
+    links_semantic['link_type'] = 'semantic'
+    bat_linked = links_semantic['rnb_id'].unique()
+    ban_linked = links_semantic['ban_id'].unique()
+    gdf_bat_orphans = gdf_bat[~gdf_bat['rnb_id'].isin(bat_linked)]
+    gdf_ban_orphans = gdf_ban[~gdf_ban['ban_id'].isin(ban_linked)]
+    links_geometric = pd.DataFrame()
+    if not gdf_bat_orphans.empty and not gdf_ban_orphans.empty:
+        sjoin_geo = gpd.sjoin_nearest(gdf_ban_orphans[['ban_id', 'geometry']], gdf_bat_orphans[['rnb_id', 'geometry']], how='inner', max_distance=50)
+        links_geometric = sjoin_geo[['ban_id', 'rnb_id']].dropna()
+        links_geometric['link_type'] = 'geometric'
+
+    all_address_links = pd.concat([links_semantic, links_geometric], ignore_index=True).drop_duplicates(subset=['rnb_id', 'ban_id'])
+
+    # B. Mapping et FILTRAGE pour créer un DataFrame final et stable
+    all_address_links['adr_idx'] = all_address_links['ban_id'].map(ban_map)
+    all_address_links['bat_idx'] = all_address_links['rnb_id'].map(bat_map)
+
+    # On crée un nouveau DataFrame propre et on réinitialise son index
     final_address_links = all_address_links.dropna(subset=['adr_idx', 'bat_idx']).reset_index(drop=True)
+
+    # C. Création des DEUX tenseurs à partir de ce DataFrame final et synchronisé
     link_type_dummies = pd.get_dummies(final_address_links['link_type'])
     for col in ['semantic', 'geometric']:
-        if col not in link_type_dummies: link_type_dummies[col] = 0
+        if col not in link_type_dummies:
+            link_type_dummies[col] = 0
+
     edge_attr_ab_semantic = torch.tensor(link_type_dummies[['semantic', 'geometric']].values, dtype=torch.float)
     edge_index_ab_semantic = torch.tensor(final_address_links[['adr_idx', 'bat_idx']].values.T, dtype=torch.long)
 
-    
     # ========================================================
     # === 2. DÉBUT : AJOUT DES LIENS SPATIAUX (MANQUANT) ===
     # (Pour forcer le GNN à apprendre la géographie)

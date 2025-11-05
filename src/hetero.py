@@ -2,6 +2,7 @@
 import torch
 from torch_geometric.nn import HeteroConv, GATv2Conv, Linear
 
+
 class HeteroGNN(torch.nn.Module):
     def __init__(self, hidden_channels, out_channels, num_layers, node_feature_sizes, edge_feature_size):
         super().__init__()
@@ -27,7 +28,7 @@ class HeteroGNN(torch.nn.Module):
         # Couches cachées
         for _ in range(num_layers - 1):
             hidden_conv_dict = {
-                rel: GATv2Conv(hidden_channels, hidden_channels, add_self_loops=False, 
+                rel: GATv2Conv(hidden_channels, hidden_channels, add_self_loops=False,
                                edge_dim=edge_feature_size if 'spatial' not in rel[1] else None)
                 for rel in relations_for_gnn
             }
