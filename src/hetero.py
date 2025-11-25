@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 # src/hetero.py
 import torch
 from torch_geometric.nn import HeteroConv, GATv2Conv, Linear
