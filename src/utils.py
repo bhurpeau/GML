@@ -6,9 +6,10 @@ import ast
 import torch
 import hdbscan
 import networkx as nx
+import torch_geometric.utils
 from torch_geometric.data import HeteroData
 from sklearn.preprocessing import MinMaxScaler, normalize
-
+from torch_geometric.nn import knn_graph
 # --- CONSTANTES ET CHEMINS ---
 TARGET_CRS = "EPSG:2154"
 BDTOPO_PATH = 'data/BDT_3-5_GPKG_LAMB93_D092-ED2025-06-15.gpkg'
@@ -194,10 +195,10 @@ def build_graph_from_golden_datasets(gdf_bat, gdf_par, gdf_ban, df_ban_links, df
     bp_links['bat_idx'] = bp_links['rnb_id'].map(bat_map)
     bp_links['par_idx'] = bp_links['parcelle_id'].map(par_map)
     bp_links.dropna(subset=['bat_idx', 'par_idx'], inplace=True)
-    edge_index_bp = torch.tensor(bp_links[['bat_idx', 'par_idx']].values.T, dtype=torch.long)
+    edge_index_bp_semantic = torch.tensor(bp_links[['bat_idx', 'par_idx']].values.T, dtype=torch.long)
     cover_ratio_tensor = torch.tensor(bp_links['cover_ratio'].values, dtype=torch.float).unsqueeze(1)
     padding_bp = torch.zeros(cover_ratio_tensor.shape[0], 1)
-    edge_attr_bp = torch.cat([cover_ratio_tensor, padding_bp], dim=1)
+    edge_attr_bp_semantic = torch.cat([cover_ratio_tensor, padding_bp], dim=1)
 
     # Lien Adresse <-> Bâtiment (Hybride)
     print("Création des liens Adresse-Bâtiment (Sémantique + Fallback Géométrique)...")
@@ -230,25 +231,81 @@ def build_graph_from_golden_datasets(gdf_bat, gdf_par, gdf_ban, df_ban_links, df
         if col not in link_type_dummies:
             link_type_dummies[col] = 0
 
-    edge_attr_ab = torch.tensor(link_type_dummies[['semantic', 'geometric']].values, dtype=torch.float)
-    edge_index_ab = torch.tensor(final_address_links[['adr_idx', 'bat_idx']].values.T, dtype=torch.long)
-    # --- FIN DE LA CORRECTION DÉFINITIVE ---
+    edge_attr_ab_semantic = torch.tensor(link_type_dummies[['semantic', 'geometric']].values, dtype=torch.float)
+    edge_index_ab_semantic = torch.tensor(final_address_links[['adr_idx', 'bat_idx']].values.T, dtype=torch.long)
 
-    # Assemblage final
+    # ========================================================
+    # === 2. DÉBUT : AJOUT DES LIENS SPATIAUX (MANQUANT) ===
+    # (Pour forcer le GNN à apprendre la géographie)
+    # ========================================================
+    print("Création des liens spatiaux (Voisinage)...")
+    K_SPATIAL = 8  # Nb de voisins géographiques à connecter
+
+    # --- Bâtiment <-> Bâtiment (k-NN sur representative_point) ---
+    print("  - Voisinage Bâtiment-Bâtiment (kNN)...")
+    coords_bat = torch.tensor(
+        gdf_bat.geometry.representative_point().apply(lambda p: (p.x, p.y)).tolist(), 
+        dtype=torch.float
+    )
+    edge_index_bb_spatial = knn_graph(coords_bat, k=K_SPATIAL, loop=False)
+
+    # --- Parcelle <-> Parcelle (Contiguïté) ---
+    print("  - Voisinage Parcelle-Parcelle (Contiguïté)...")
+    # S'assurer que l'index de gdf_par correspond à par_x (0 à N-1)
+    gdf_par_spatial = gdf_par.copy().reset_index(drop=True)
+    gdf_par_spatial['node_idx'] = gdf_par_spatial.index
+    
+    # 'touches' est plus strict que 'intersects'
+    sjoined_par = gpd.sjoin(
+        gdf_par_spatial[['geometry', 'node_idx']], 
+        gdf_par_spatial[['geometry', 'node_idx']], 
+        how='inner', 
+        predicate='touches'
+    )
+    # Filtrer les auto-liens
+    sjoined_par = sjoined_par[sjoined_par['node_idx_left'] != sjoined_par['node_idx_right']]
+    edge_list_par = sjoined_par[['node_idx_left', 'node_idx_right']].values
+    edge_index_pp_spatial = torch.tensor(edge_list_par.T, dtype=torch.long)
+    # Rendre bidirectionnel et unique
+    edge_index_pp_spatial = torch_geometric.utils.to_undirected(edge_index_pp_spatial)
+
+    # --- Adresse <-> Adresse (k-NN sur géométrie) ---
+    print("  - Voisinage Adresse-Adresse (kNN)...")
+    coords_ban = torch.tensor(
+        gdf_ban.geometry.apply(lambda p: (p.x, p.y)).tolist(), 
+        dtype=torch.float
+    )
+    edge_index_aa_spatial = knn_graph(coords_ban, k=K_SPATIAL, loop=False)
+    
+    # ========================================================
+    # === FIN : AJOUT DES LIENS SPATIAUX ===
+    # ========================================================
+
+
+    # === 3. Assemblage final (MODIFIÉ) ===
     data = HeteroData()
     data['bâtiment'].x = bat_x
     data['parcelle'].x = par_x
     data['adresse'].x = ban_x
-    data['bâtiment', 'appartient', 'parcelle'].edge_index = edge_index_bp
-    data['bâtiment', 'appartient', 'parcelle'].edge_attr = edge_attr_bp
-    data['parcelle', 'contient', 'bâtiment'].edge_index = edge_index_bp.flip(0)
-    data['parcelle', 'contient', 'bâtiment'].edge_attr = edge_attr_bp
-    data['adresse', 'accès', 'bâtiment'].edge_index = edge_index_ab
-    data['adresse', 'accès', 'bâtiment'].edge_attr = edge_attr_ab
-    data['bâtiment', 'desservi_par', 'adresse'].edge_index = edge_index_ab.flip(0)
-    data['bâtiment', 'desservi_par', 'adresse'].edge_attr = edge_attr_ab
 
-    print("Graphe final construit.")
+    # Liens SÉMANTIQUES (Utilisés par la PERTE et le GNN)
+    data['bâtiment', 'appartient', 'parcelle'].edge_index = edge_index_bp_semantic
+    data['bâtiment', 'appartient', 'parcelle'].edge_attr = edge_attr_bp_semantic
+    data['parcelle', 'contient', 'bâtiment'].edge_index = edge_index_bp_semantic.flip(0)
+    data['parcelle', 'contient', 'bâtiment'].edge_attr = edge_attr_bp_semantic
+    
+    data['adresse', 'accès', 'bâtiment'].edge_index = edge_index_ab_semantic
+    data['adresse', 'accès', 'bâtiment'].edge_attr = edge_attr_ab_semantic
+    data['bâtiment', 'desservi_par', 'adresse'].edge_index = edge_index_ab_semantic.flip(0)
+    data['bâtiment', 'desservi_par', 'adresse'].edge_attr = edge_attr_ab_semantic
+
+    # NOUVEAUX Liens SPATIAUX (Utilisés SEULEMENT par le GNN)
+    # Ces arêtes n'ont pas d'attributs (edge_attr=None)
+    data['bâtiment', 'spatial', 'bâtiment'].edge_index = edge_index_bb_spatial
+    data['parcelle', 'spatial', 'parcelle'].edge_index = edge_index_pp_spatial
+    data['adresse', 'spatial', 'adresse'].edge_index = edge_index_aa_spatial
+
+    print("Graphe final (sémantique + spatial) construit.")
     return data, bat_map
 
 

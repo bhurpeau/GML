@@ -89,14 +89,14 @@ def objective(trial, cache, device, epochs):
     entropy_weight = trial.suggest_float("entropy_weight", 5e-4, 5e-3, log=True)
     lam_g = trial.suggest_float("lam_g", 1e-4, 2e-3, log=True)
 
-    beta_max = trial.suggest_categorical("beta_max",  [4.0, 5.0, 6.0, 8.0])
-    gamma_max = trial.suggest_categorical("gamma_max", [1.5, 2.0, 2.5, 3.0])
+    beta_max = trial.suggest_categorical("beta_max",  [4.0, 5.0, 6.0])
+    gamma_max = trial.suggest_categorical("gamma_max", [1.0, 1.5, 2.0])
     anneal_step = trial.suggest_categorical("anneal_step", [5, 10])
 
     prune_delay_ep = trial.suggest_categorical("prune_delay_epoch", [20, 40, 60, 80])
     prune_every = trial.suggest_categorical("prune_every", [10, 20])
 
-    # tailles fixes (tu peux aussi les explorer)
+    # tailles fixes
     L = M = N = 64
     emb_dim = 64
     hidden = 64

@@ -9,3 +9,4 @@ out/
 **/.ipynb_checkpoints/
 ./**/.ipynb_checkpoints/
 *.ipynb
+main_run.py
