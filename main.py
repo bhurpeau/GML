@@ -76,12 +76,14 @@ def main():
     X = data['adresse'].x.size(0)
     Y = data['bâtiment'].x.size(0)
     Z = data['parcelle'].x.size(0)
+    metadata = data.metadata()
 
     print("=== Initialisation du modèle ===")
     model = HeteroGNN(
         hidden_channels=args.hidden,
         out_channels=args.emb_dim,
         num_layers=2,
+        metadata=metadata,
         node_feature_sizes=node_feature_sizes,
         edge_feature_size=2
     ).to(device)

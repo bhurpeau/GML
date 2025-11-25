@@ -172,13 +172,34 @@ def train_dmon3p(
                 Sx_mean = torch.softmax(Sx_logits, dim=1).mean(dim=0)
                 Sy_mean = torch.softmax(Sy_logits, dim=1).mean(dim=0)
                 Sz_mean = torch.softmax(Sz_logits, dim=1).mean(dim=0)
-                prune_columns(
+                masks = prune_columns(
                     heads, criterion,
                     usage={'X': Sx_mean, 'Y': Sy_mean, 'Z': Sz_mean},
                     gates={'X': gX, 'Y': gY, 'Z': gZ},
                     min_usage=min_usage, min_gate=min_gate, which='Y'  # priorité Y
                 )
-
+                # DÉTECTION : A-t-on réellement réduit la taille ?
+                has_pruned = False
+                for k, m in masks.items():
+                    # Si le masque contient au moins un False, c'est qu'on a coupé
+                    if m.sum() < m.numel():
+                        has_pruned = True
+                        break
+                
+                # CORRECTION : Si pruning, on recrée l'optimiseur avec les nouveaux paramètres
+                if has_pruned:
+                    print(f"[{epoch:03d}] ✂️ Pruning effectué. Réinitialisation de l'optimiseur.")
+                    
+                    # On conserve le Learning Rate actuel (au cas où tu utiliserais un Scheduler)
+                    current_lr = optimizer.param_groups[0]['lr']
+                    current_wd = optimizer.param_groups[0]['weight_decay']
+                    
+                    # On recrée l'optimiseur pour qu'il pointe vers les nouveaux tenseurs
+                    optimizer = torch.optim.Adam(
+                        list(model.parameters()) + list(heads.parameters()),
+                        lr=current_lr, 
+                        weight_decay=current_wd
+                    )
     # ----------------------
     # Inférence "soft" finale
     # ----------------------

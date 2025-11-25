@@ -61,12 +61,13 @@ def load_data(device):
     return data, bat_map, node_feature_sizes, (X, Y, Z), edge_index_XY, edge_index_YZ, w_XY, w_YZ
 
 
-def build_model(data, node_feature_sizes, L, M, N, emb_dim, hidden, device):
+def build_model(data, metadata, node_feature_sizes, L, M, N, emb_dim, hidden, device):
     """Construit un nouvel encodeur + têtes + critère pour un essai."""
     model = HeteroGNN(
         hidden_channels=hidden,
         out_channels=emb_dim,
         num_layers=2,
+        metadata=metadata,
         node_feature_sizes=node_feature_sizes,
         edge_feature_size=2
     ).to(device)
@@ -83,7 +84,7 @@ def objective(trial, cache, device, epochs):
     """
     (data, bat_map, node_feature_sizes, (X, Y, Z),
      edge_index_XY, edge_index_YZ, w_XY, w_YZ) = cache
-
+    metadata = data.metadata()
     # --- espace de recherche ---
     lambda_collapse = trial.suggest_float("lambda_collapse", 0.05, 5.0, log=True)
     entropy_weight = trial.suggest_float("entropy_weight", 5e-4, 5e-3, log=True)
@@ -95,14 +96,14 @@ def objective(trial, cache, device, epochs):
 
     prune_delay_ep = trial.suggest_categorical("prune_delay_epoch", [20, 40, 60, 80])
     prune_every = trial.suggest_categorical("prune_every", [10, 20])
-
+    
     # tailles fixes
     L = M = N = 64
     emb_dim = 64
     hidden = 64
 
     # --- modèle neuf par essai ---
-    model, heads = build_model(data, node_feature_sizes, L, M, N, emb_dim, hidden, device)
+    model, heads = build_model(data, metadata, node_feature_sizes, L, M, N, emb_dim, hidden, device)
 
     criterion = DMoN3P(
         num_X=X, num_Y=Y, num_Z=Z,
