@@ -3,8 +3,6 @@
 
 # Nom de l'environnement virtuel pour l'isolation
 VENV_DIR=".venv"
-# git clone https://git.lab.sspcloud.fr/bhurpeau/gml.git
-# cd gml
 echo "--- Démarrage de la configuration de l'environnement GML ---"
 
 # --- 1. Installation des dépendances ---

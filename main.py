@@ -30,6 +30,7 @@ def parse_args():
     p.add_argument("--N", type=int, default=64, help="#clusters max for Z (parcelles)")
     p.add_argument("--beta", type=float, default=2.0)
     p.add_argument("--gamma", type=float, default=1.0)
+    p.add_argument("--anneal_step", type=int, default=10)
     p.add_argument("--entropy_weight", type=float, default=1e-3)
     p.add_argument("--lambda_collapse", type=float, default=1e-4)
     p.add_argument("--lr", type=float, default=1e-3)
@@ -123,12 +124,12 @@ def main():
         data, edge_index_XY, edge_index_YZ, w_XY=w_XY, w_YZ=w_YZ,
         epochs=args.epochs,
         device=device,
-        lam_g=1e-3,
+        lam_g=0.00020650052914410045,
         clip_grad=1.0,
-        schedule_beta=(args.beta, 4.0, 10),
-        schedule_gamma=(args.gamma, 2.0, 10),
+        schedule_beta=(2.0, args.beta, args.anneal_step),
+        schedule_gamma=(1.0, args.gamma, args.anneal_step),
         prune_every=args.epochs_prune,
-        prune_delay_epoch=70,
+        prune_delay_epoch=40,
         min_usage=2e-3,
         min_gate=0.10,
         m_chunk=args.m_chunk,

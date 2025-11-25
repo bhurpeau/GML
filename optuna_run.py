@@ -167,7 +167,7 @@ def objective(trial, cache, device, epochs):
 def main():
     parser = argparse.ArgumentParser("Optuna search for DMoN-3p")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--epochs", type=int, default=120)
+    parser.add_argument("--epochs", type=int, default=240)
     parser.add_argument("--trials", type=int, default=30)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--storage", type=str, default=None,
