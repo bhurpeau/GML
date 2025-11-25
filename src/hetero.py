@@ -13,16 +13,16 @@ class HeteroGNN(torch.nn.Module):
         """
         super().__init__()
         self.convs = torch.nn.ModuleList()
-        
+
         # On déballe les métadonnées pour obtenir la liste dynamique des relations
         self.node_types, self.edge_types = metadata
 
         # Fonction locale pour déterminer si une arête a des attributs
-        # (Tes arêtes spatiales n'en ont pas, tes arêtes sémantiques en ont)
         def get_edge_dim(rel_type):
-            # rel_type est un triplet (src, relation, dst)
-            # Si le nom de la relation contient 'spatial', pas d'attributs
-            if 'spatial' in rel_type[1]:
+            src, rel, dst = rel_type
+            if rel == 'spatial' and (src == 'bâtiment' or src == 'parcelle'):
+                return 1
+            if src == 'adresse' and rel == 'spatial':
                 return None
             return edge_feature_size
 
