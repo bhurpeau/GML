@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
-#!/usr/bin/env python
+# src/utils.py
 import pandas as pd
 import geopandas as gpd
+import numpy as np
 import ast
 import torch
 import hdbscan
@@ -10,6 +11,7 @@ import torch_geometric.utils
 from torch_geometric.data import HeteroData
 from sklearn.preprocessing import MinMaxScaler, normalize
 from torch_geometric.nn import knn_graph
+from torch_sparse import SparseTensor
 # --- CONSTANTES ET CHEMINS ---
 TARGET_CRS = "EPSG:2154"
 BDTOPO_PATH = 'data/BDT_3-5_GPKG_LAMB93_D092-ED2025-06-15.gpkg'
@@ -19,6 +21,113 @@ BDNB_PATH = 'data/bdnb.gpkg'
 RNB_PATH = 'data/RNB_92.csv'
 BAN_PATH = 'data/adresses-92.csv'
 PLU_PATH = 'data/wfs_du.gpkg'
+
+
+def fourier_features(coords, num_bands=4):
+    """
+    Projette (x, y) vers [sin(2^0 \pi x), cos(2^0 \pi x), ..., sin(2^k \pi y), ...]
+    """
+    coords = coords * np.pi # Suppose coords dans [0, 1]
+    features = [coords] # On garde l'original
+    for i in range(num_bands):
+        freq = 2.0 ** i
+        features.append(torch.sin(coords * freq))
+        features.append(torch.cos(coords * freq))
+    return torch.cat(features, dim=1)
+
+
+def project_building_adjacency_sparse(num_bat, num_par, edge_index_bp, edge_index_pp, weights_pp):
+    """
+    Projette le graphe Parcelle-Parcelle sur les Bâtiments via calcul matriciel creux.
+    Conserve les poids (longueurs de frontières).
+    """
+    device = edge_index_bp.device
+
+    # 1. Matrice d'incidence Bâtiment -> Parcelle (M_bp)
+    # On met des 1.0 pour dire "ce bâtiment est sur cette parcelle"
+    # Dimension : [num_bat, num_par]
+    val_bp = torch.ones(edge_index_bp.size(1), device=device)
+    M_bp = SparseTensor(
+        row=edge_index_bp[0], col=edge_index_bp[1], value=val_bp,
+        sparse_sizes=(num_bat, num_par)
+    )
+
+    # 2. Matrice d'adjacence Parcelle <-> Parcelle (A_pp)
+    # On utilise les POIDS calculés (longueurs frontières) comme valeurs !
+    # Dimension : [num_par, num_par]
+    # weights_pp doit être 1D ici
+    if weights_pp.dim() > 1: weights_pp = weights_pp.squeeze()
+    
+    A_pp = SparseTensor(
+        row=edge_index_pp[0], col=edge_index_pp[1], value=weights_pp,
+        sparse_sizes=(num_par, num_par)
+    )
+
+    # 3. Ajout de l'identité (Self-loops pour parcelles)
+    # Permet de connecter deux bâtiments situés sur la MÊME parcelle.
+    A_pp = A_pp.fill_diag(1.0)
+
+    # 4. A_bb = M_bp @ A_pp @ M_bp.T
+    # Cela calcule la somme des frontières partagées par les parcelles hôtes
+    res = M_bp @ A_pp @ M_bp.t()
+
+    # 5. Extraction
+    row, col, val = res.coo()
+
+    # Filtrage des auto-boucles (bâtiment sur lui-même)
+    mask = row != col
+
+    final_edge_index = torch.stack([row[mask], col[mask]], dim=0)
+    final_edge_weight = val[mask]
+
+    return final_edge_index, final_edge_weight
+
+
+def compute_shape_features(gdf):
+    """
+    Calcule des descripteurs morphologiques pour une GeoSeries de polygones.
+    Retourne un DataFrame normalisé.
+    """
+    geoms = gdf.geometry
+
+    # 1. Compactness (Polsby-Popper score): 4*pi*Area / Perimeter^2
+    # Proche de 1 = cercle/carré, Proche de 0 = très allongé ou complexe
+    area = geoms.area
+    perimeter = geoms.length
+    compactness = (4 * np.pi * area) / (perimeter ** 2 + 1e-6)
+
+    # 2. Convexity: Area / ConvexHull_Area
+    # 1.0 = convexe, <1.0 = forme creuse (U, L, H)
+    convex_area = geoms.convex_hull.area
+    convexity = area / (convex_area + 1e-6)
+
+    # 3. Elongation: (1 - Width/Length) du rectangle englobant (Minimum Bounding Box)
+    # Nécessite un calcul par ligne un peu plus coûteux, on simplifie avec Bounds
+    # ou on utilise l'approximation via l'inertie si besoin.
+    # Ici, une approche simple via le rectangle orienté :
+    def get_elongation(poly):
+        if poly.is_empty: return 0
+        rect = poly.minimum_rotated_rectangle
+        x, y = rect.exterior.coords.xy
+        # Calcul des longueurs des côtés adjacents
+        d1 = np.sqrt((x[1]-x[0])**2 + (y[1]-y[0])**2)
+        d2 = np.sqrt((x[2]-x[1])**2 + (y[2]-y[1])**2)
+        width, length = sorted([d1, d2])
+        return 1 - (width / (length + 1e-6))
+
+    elongation = geoms.apply(get_elongation)
+
+    # 4. Fractal Dimension (Approximation): 2 * log(Perimeter) / log(Area)
+    fractality = (2 * np.log(perimeter + 1e-6)) / (np.log(area + 1e-6))
+
+    features = pd.DataFrame({
+        'compactness': compactness,
+        'convexity': convexity,
+        'elongation': elongation,
+        'fractality': fractality
+    }, index=gdf.index)
+
+    return features
 
 
 def parse_rnb_links(df_rnb):
@@ -149,13 +258,18 @@ def prepare_node_features(gdf_bat, gdf_par, gdf_ban):
     bat_features['ffo_bat_nb_log'] = pd.to_numeric(bat_features['ffo_bat_nb_log'], errors='coerce').fillna(median_logs)
     bat_features['bdtopo_bat_l_usage_1'] = bat_features['bdtopo_bat_l_usage_1'].fillna("Inconnu")
     bat_features['surface'] = bat_features.geometry.area
+
+    # Encodage One-Hot des features bâtiment
     categorical_feats = ['bdtopo_bat_l_usage_1', 'decennie_construction']
     one_hot_encoded = pd.get_dummies(bat_features[categorical_feats], prefix=['usage', 'decennie'], dtype=int)
     numerical_feats = ['surface', 'ffo_bat_nb_log']
     scaled_numerical = scaler.fit_transform(bat_features[numerical_feats])
     scaled_numerical_df = pd.DataFrame(scaled_numerical, columns=numerical_feats, index=bat_features.index)
-
-    final_bat_features_df = pd.concat([scaled_numerical_df, one_hot_encoded], axis=1)
+    # Morphologie des bâtiments
+    shape_feats_bat = compute_shape_features(gdf_bat)
+    scaled_shape_bat = scaler.fit_transform(shape_feats_bat)
+    scaled_shape_bat_df = pd.DataFrame(scaled_shape_bat, columns=shape_feats_bat.columns, index=gdf_bat.index)
+    final_bat_features_df = pd.concat([scaled_numerical_df, one_hot_encoded, scaled_shape_bat_df], axis=1)
     bat_x = torch.tensor(final_bat_features_df.values, dtype=torch.float)
 
     # Parcelles
@@ -169,63 +283,77 @@ def prepare_node_features(gdf_bat, gdf_par, gdf_ban):
     scaled_superficie = scaler.fit_transform(gdf_par[['superficie']])
     scaled_superficie_df = pd.DataFrame(scaled_superficie, columns=['superficie'], index=gdf_par.index)
 
+    # Morphologie des parcelles
+    shape_feats_par = compute_shape_features(gdf_par)
+    scaled_shape_par = scaler.fit_transform(shape_feats_par)
+    scaled_shape_par_df = pd.DataFrame(scaled_shape_par, columns=shape_feats_par.columns, index=gdf_par.index)
+
     # Concaténation et création du tenseur final pour les parcelles
-    final_par_features_df = pd.concat([scaled_superficie_df, one_hot_encoded_plu], axis=1)
+    final_par_features_df = pd.concat([scaled_superficie_df, one_hot_encoded_plu, scaled_shape_par_df], axis=1)
     par_x = torch.tensor(final_par_features_df.values, dtype=torch.float)
 
     # Adresses
     gdf_ban['x'] = gdf_ban.geometry.x
     gdf_ban['y'] = gdf_ban.geometry.y
     gdf_ban[['x', 'y']] = scaler.fit_transform(gdf_ban[['x', 'y']])
-    ban_x = torch.tensor(gdf_ban[['x', 'y']].values, dtype=torch.float)
-
+    ban_coords = torch.tensor(gdf_ban[['x', 'y']].values, dtype=torch.float)
+    ban_x = fourier_features(ban_coords, num_bands=4)
     return bat_x, par_x, ban_x
 
 
 def build_graph_from_golden_datasets(gdf_bat, gdf_par, gdf_ban, df_ban_links, df_parcelle_links):
     print("\n--- Étape 2 : Construction du Graphe ---")
+
+    # 1. Préparation des features
     bat_x, par_x, ban_x = prepare_node_features(gdf_bat, gdf_par, gdf_ban)
 
+    # Création des maps ID -> Index
     bat_map = {id: i for i, id in enumerate(gdf_bat['rnb_id'])}
     par_map = {id: i for i, id in enumerate(gdf_par['parcelle_id'])}
     ban_map = {id: i for i, id in enumerate(gdf_ban['ban_id'])}
 
-    # Lien Bâtiment <-> Parcelle (logique correcte)
+    # ========================================================
+    # A. LIENS SÉMANTIQUES
+    # ========================================================
+
+    # --- Lien Bâtiment <-> Parcelle ---
     bp_links = df_parcelle_links.copy()
     bp_links['bat_idx'] = bp_links['rnb_id'].map(bat_map)
     bp_links['par_idx'] = bp_links['parcelle_id'].map(par_map)
     bp_links.dropna(subset=['bat_idx', 'par_idx'], inplace=True)
+
     edge_index_bp_semantic = torch.tensor(bp_links[['bat_idx', 'par_idx']].values.T, dtype=torch.long)
+
+    # Attributs
     cover_ratio_tensor = torch.tensor(bp_links['cover_ratio'].values, dtype=torch.float).unsqueeze(1)
     padding_bp = torch.zeros(cover_ratio_tensor.shape[0], 1)
     edge_attr_bp_semantic = torch.cat([cover_ratio_tensor, padding_bp], dim=1)
 
-    # Lien Adresse <-> Bâtiment (Hybride)
-    print("Création des liens Adresse-Bâtiment (Sémantique + Fallback Géométrique)...")
-
-    # A. Combinaison des liens
+    # --- Lien Adresse <-> Bâtiment ---
+    print("Création des liens Adresse-Bâtiment...")
     links_semantic = df_ban_links.copy()
     links_semantic['link_type'] = 'semantic'
+
     bat_linked = links_semantic['rnb_id'].unique()
     ban_linked = links_semantic['ban_id'].unique()
     gdf_bat_orphans = gdf_bat[~gdf_bat['rnb_id'].isin(bat_linked)]
     gdf_ban_orphans = gdf_ban[~gdf_ban['ban_id'].isin(ban_linked)]
+
     links_geometric = pd.DataFrame()
     if not gdf_bat_orphans.empty and not gdf_ban_orphans.empty:
-        sjoin_geo = gpd.sjoin_nearest(gdf_ban_orphans[['ban_id', 'geometry']], gdf_bat_orphans[['rnb_id', 'geometry']], how='inner', max_distance=50)
+        sjoin_geo = gpd.sjoin_nearest(gdf_ban_orphans[['ban_id', 'geometry']], 
+                                      gdf_bat_orphans[['rnb_id', 'geometry']], 
+                                      how='inner', max_distance=50)
         links_geometric = sjoin_geo[['ban_id', 'rnb_id']].dropna()
         links_geometric['link_type'] = 'geometric'
 
-    all_address_links = pd.concat([links_semantic, links_geometric], ignore_index=True).drop_duplicates(subset=['rnb_id', 'ban_id'])
+    all_address_links = pd.concat([links_semantic, links_geometric], ignore_index=True)
+    all_address_links = all_address_links.drop_duplicates(subset=['rnb_id', 'ban_id'])
 
-    # B. Mapping et FILTRAGE pour créer un DataFrame final et stable
     all_address_links['adr_idx'] = all_address_links['ban_id'].map(ban_map)
     all_address_links['bat_idx'] = all_address_links['rnb_id'].map(bat_map)
-
-    # On crée un nouveau DataFrame propre et on réinitialise son index
     final_address_links = all_address_links.dropna(subset=['adr_idx', 'bat_idx']).reset_index(drop=True)
 
-    # C. Création des DEUX tenseurs à partir de ce DataFrame final et synchronisé
     link_type_dummies = pd.get_dummies(final_address_links['link_type'])
     for col in ['semantic', 'geometric']:
         if col not in link_type_dummies:
@@ -235,77 +363,114 @@ def build_graph_from_golden_datasets(gdf_bat, gdf_par, gdf_ban, df_ban_links, df
     edge_index_ab_semantic = torch.tensor(final_address_links[['adr_idx', 'bat_idx']].values.T, dtype=torch.long)
 
     # ========================================================
-    # === 2. DÉBUT : AJOUT DES LIENS SPATIAUX (MANQUANT) ===
-    # (Pour forcer le GNN à apprendre la géographie)
+    # B. LIENS SPATIAUX & TOPOLOGIQUES
     # ========================================================
-    print("Création des liens spatiaux (Voisinage)...")
-    K_SPATIAL = 8  # Nb de voisins géographiques à connecter
+    print("Création des liens spatiaux...")
+    K_SPATIAL = 8
 
-    # --- Bâtiment <-> Bâtiment (k-NN sur representative_point) ---
-    print("  - Voisinage Bâtiment-Bâtiment (kNN)...")
-    coords_bat = torch.tensor(
-        gdf_bat.geometry.representative_point().apply(lambda p: (p.x, p.y)).tolist(), 
-        dtype=torch.float
-    )
-    edge_index_bb_spatial = knn_graph(coords_bat, k=K_SPATIAL, loop=False)
+    # --- 1. Parcelle <-> Parcelle  ---
+    print("  - Voisinage Parcelle-Parcelle (Frontières partagées)...")
 
-    # --- Parcelle <-> Parcelle (Contiguïté) ---
-    print("  - Voisinage Parcelle-Parcelle (Contiguïté)...")
-    # S'assurer que l'index de gdf_par correspond à par_x (0 à N-1)
     gdf_par_spatial = gdf_par.copy().reset_index(drop=True)
     gdf_par_spatial['node_idx'] = gdf_par_spatial.index
-    
-    # 'touches' est plus strict que 'intersects'
+
+    # Jointure spatiale
     sjoined_par = gpd.sjoin(
         gdf_par_spatial[['geometry', 'node_idx']], 
         gdf_par_spatial[['geometry', 'node_idx']], 
         how='inner', 
         predicate='touches'
     )
-    # Filtrer les auto-liens
     sjoined_par = sjoined_par[sjoined_par['node_idx_left'] != sjoined_par['node_idx_right']]
-    edge_list_par = sjoined_par[['node_idx_left', 'node_idx_right']].values
-    edge_index_pp_spatial = torch.tensor(edge_list_par.T, dtype=torch.long)
-    # Rendre bidirectionnel et unique
-    edge_index_pp_spatial = torch_geometric.utils.to_undirected(edge_index_pp_spatial)
 
-    # --- Adresse <-> Adresse (k-NN sur géométrie) ---
+    # Calcul des longueurs
+    src_indices = sjoined_par['node_idx_left'].values
+    dst_indices = sjoined_par['node_idx_right'].values
+    geoms = gdf_par_spatial.geometry.values
+
+    weights_list = []
+    # Note: Optimisable, mais acceptable pour le prototypage
+    for s, d in zip(src_indices, dst_indices):
+        try:
+            inter = geoms[s].intersection(geoms[d])
+            w = inter.length
+        except Exception:
+            w = 0.0
+        weights_list.append(w)
+
+    # Création du tenseur P-P final (Undirected)
+    edge_index_temp = torch.tensor([src_indices, dst_indices], dtype=torch.long)
+    weights_tensor = torch.tensor(weights_list, dtype=torch.float).unsqueeze(1)
+    edge_attr_pp_spatial = torch.log1p(weights_tensor) # Normalisation
+
+    edge_index_pp_spatial, edge_attr_pp_spatial = torch_geometric.utils.to_undirected(
+        edge_index_temp, 
+        edge_attr=edge_attr_pp_spatial
+    )
+
+    # --- 2. Bâtiment <-> Bâtiment (Projection via SparseTensor) ---
+    # (Maintenant possible car src_indices et weights_list existent)
+    print("  - Voisinage Bâtiment-Bâtiment (Projection Sparse)...")
+
+    num_bat_total = bat_x.size(0)
+    num_par_total = par_x.size(0)
+
+    # On utilise les liens Bat-Parc existants
+    edge_index_bp_raw = torch.tensor(bp_links[['bat_idx', 'par_idx']].values.T, dtype=torch.long)
+
+    # On utilise les liens Parc-Parc bruts (dirigés) calculés juste au-dessus
+    edge_index_pp_raw = torch.tensor([src_indices, dst_indices], dtype=torch.long)
+    weights_pp_raw = torch.tensor(weights_list, dtype=torch.float)
+
+    # Appel de la fonction magique
+    edge_index_bb, weights_bb = project_building_adjacency_sparse(
+        num_bat_total, num_par_total,
+        edge_index_bp_raw,
+        edge_index_pp_raw,
+        weights_pp_raw
+    )
+
+    edge_attr_bb_spatial = torch.log1p(weights_bb).unsqueeze(1)
+    edge_index_bb_spatial = edge_index_bb
+
+    # --- 3. Adresse <-> Adresse (k-NN) ---
     print("  - Voisinage Adresse-Adresse (kNN)...")
     coords_ban = torch.tensor(
         gdf_ban.geometry.apply(lambda p: (p.x, p.y)).tolist(), 
         dtype=torch.float
     )
     edge_index_aa_spatial = knn_graph(coords_ban, k=K_SPATIAL, loop=False)
-    
-    # ========================================================
-    # === FIN : AJOUT DES LIENS SPATIAUX ===
-    # ========================================================
 
 
-    # === 3. Assemblage final (MODIFIÉ) ===
+    # ========================================================
+    # C. ASSEMBLAGE FINAL
+    # ========================================================
     data = HeteroData()
     data['bâtiment'].x = bat_x
     data['parcelle'].x = par_x
     data['adresse'].x = ban_x
 
-    # Liens SÉMANTIQUES (Utilisés par la PERTE et le GNN)
+    # Sémantique
     data['bâtiment', 'appartient', 'parcelle'].edge_index = edge_index_bp_semantic
     data['bâtiment', 'appartient', 'parcelle'].edge_attr = edge_attr_bp_semantic
     data['parcelle', 'contient', 'bâtiment'].edge_index = edge_index_bp_semantic.flip(0)
     data['parcelle', 'contient', 'bâtiment'].edge_attr = edge_attr_bp_semantic
-    
+
     data['adresse', 'accès', 'bâtiment'].edge_index = edge_index_ab_semantic
     data['adresse', 'accès', 'bâtiment'].edge_attr = edge_attr_ab_semantic
     data['bâtiment', 'desservi_par', 'adresse'].edge_index = edge_index_ab_semantic.flip(0)
     data['bâtiment', 'desservi_par', 'adresse'].edge_attr = edge_attr_ab_semantic
 
-    # NOUVEAUX Liens SPATIAUX (Utilisés SEULEMENT par le GNN)
-    # Ces arêtes n'ont pas d'attributs (edge_attr=None)
+    # Spatial (PolygonGNN + Projection)
     data['bâtiment', 'spatial', 'bâtiment'].edge_index = edge_index_bb_spatial
+    data['bâtiment', 'spatial', 'bâtiment'].edge_attr = edge_attr_bb_spatial
+
     data['parcelle', 'spatial', 'parcelle'].edge_index = edge_index_pp_spatial
+    data['parcelle', 'spatial', 'parcelle'].edge_attr = edge_attr_pp_spatial
+
     data['adresse', 'spatial', 'adresse'].edge_index = edge_index_aa_spatial
 
-    print("Graphe final (sémantique + spatial) construit.")
+    print("Graphe final (sémantique + spatial complet) construit.")
     return data, bat_map
 
 
