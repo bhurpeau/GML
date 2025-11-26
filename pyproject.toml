@@ -16,6 +16,7 @@ dependencies = [
     "hdbscan>=0.8.40",
     "scipy>=1.16.2",
     "optuna>=4.5.0",
+    "matplotlib>=3.10.7",
 ]
 
 [dependency-groups]

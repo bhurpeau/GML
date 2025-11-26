@@ -368,8 +368,7 @@ def build_graph_from_golden_datasets(gdf_bat, gdf_par, gdf_ban, df_ban_links, df
     print("Création des liens spatiaux...")
     K_SPATIAL = 8
 
-    # --- 1. Parcelle <-> Parcelle (PRIORITAIRE : CALCUL DES FRONTIERES) ---
-    # (Déplacé ici car requis pour l'étape suivante)
+    # --- 1. Parcelle <-> Parcelle  ---
     print("  - Voisinage Parcelle-Parcelle (Frontières partagées)...")
 
     gdf_par_spatial = gdf_par.copy().reset_index(drop=True)
@@ -413,12 +412,12 @@ def build_graph_from_golden_datasets(gdf_bat, gdf_par, gdf_ban, df_ban_links, df
     # (Maintenant possible car src_indices et weights_list existent)
     print("  - Voisinage Bâtiment-Bâtiment (Projection Sparse)...")
 
-    num_bat_total = len(bat_map)
-    num_par_total = len(par_map)
+    num_bat_total = bat_x.size(0)
+    num_par_total = par_x.size(0)
 
     # On utilise les liens Bat-Parc existants
     edge_index_bp_raw = torch.tensor(bp_links[['bat_idx', 'par_idx']].values.T, dtype=torch.long)
-    
+
     # On utilise les liens Parc-Parc bruts (dirigés) calculés juste au-dessus
     edge_index_pp_raw = torch.tensor([src_indices, dst_indices], dtype=torch.long)
     weights_pp_raw = torch.tensor(weights_list, dtype=torch.float)
@@ -465,14 +464,16 @@ def build_graph_from_golden_datasets(gdf_bat, gdf_par, gdf_ban, df_ban_links, df
     # Spatial (PolygonGNN + Projection)
     data['bâtiment', 'spatial', 'bâtiment'].edge_index = edge_index_bb_spatial
     data['bâtiment', 'spatial', 'bâtiment'].edge_attr = edge_attr_bb_spatial
-    
+
     data['parcelle', 'spatial', 'parcelle'].edge_index = edge_index_pp_spatial
     data['parcelle', 'spatial', 'parcelle'].edge_attr = edge_attr_pp_spatial
-    
+
     data['adresse', 'spatial', 'adresse'].edge_index = edge_index_aa_spatial
 
     print("Graphe final (sémantique + spatial complet) construit.")
     return data, bat_map
+
+
 def perform_hdbscan_clustering(embeddings_tensor, node_map):
     """Effectue le clustering sémantique avec HDBSCAN."""
     print("\n--- 4. Détection de Communautés Sémantiques (HDBSCAN) ---")
