@@ -27,8 +27,8 @@ This project uses [uv](https://github.com/astral-sh/uv) for dependency managemen
 ### Setup
 1.  Clone the repository:
     ```bash
-    git clone [https://github.com/username/topological-urban-clustering.git](https://github.com/username/topological-urban-clustering.git)
-    cd topological-urban-clustering
+    git clone https://github.com/bhurpeau/GML.git
+    cd GML
     ```
 
 2.  Install dependencies.
@@ -37,10 +37,10 @@ This project uses [uv](https://github.com/astral-sh/uv) for dependency managemen
     # Install standard dependencies
     uv sync
 
-    # Install PyG binaries (Example for PyTorch 2.5.1 + CUDA 12.4)
-    # Adjust the URL according to your setup: [https://data.pyg.org/whl/](https://data.pyg.org/whl/)
+    # Install PyG binaries (Example for PyTorch 2.5.0 + CUDA 12.4)
+    
     uv pip install torch-scatter torch-sparse torch-cluster \
-      --find-links [https://data.pyg.org/whl/torch-2.5.1+cu124.html](https://data.pyg.org/whl/torch-2.5.1+cu124.html)
+      -f https://data.pyg.org/whl/torch-2.5.0+cu124.html
     ```
 
 ## 📂 Data
@@ -96,6 +96,6 @@ If you use this code or method, please cite the associated working paper:
 
 ## 📄 License
 
-[MIT License](https://www.google.com/search?q=LICENSE)
+[MIT License](https://opensource.org/license/mit)
 
 ```
