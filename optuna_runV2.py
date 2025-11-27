@@ -192,7 +192,9 @@ def main():
     study.optimize(_objective, n_trials=args.trials, gc_after_trial=True)
 
     print("\n=== Meilleurs paramètres ===")
-    print(study.best_params)
+    print("Score(Q):", study.best_value)
+    print("Params  :", study.best_params)
+    print("Attrs   :", study.best_trial.user_attrs)
 
 
 if __name__ == "__main__":

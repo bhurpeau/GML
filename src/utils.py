@@ -25,7 +25,7 @@ PLU_PATH = 'data/wfs_du.gpkg'
 
 def fourier_features(coords, num_bands=4):
     """
-    Projette (x, y) vers [sin(2^0 \pi x), cos(2^0 \pi x), ..., sin(2^k \pi y), ...]
+    Projette (x, y) vers [sin(2^0 pi x), cos(2^0 pi x), ..., sin(2^k pi y), ...]
     """
     coords = coords * np.pi # Suppose coords dans [0, 1]
     features = [coords] # On garde l'original

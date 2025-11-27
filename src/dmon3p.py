@@ -68,7 +68,10 @@ class DMoN3P(nn.Module):
         valid_y_mask = (degX_Y > 0) & (degZ_Y > 0)
         prod_deg = degX_Y * degZ_Y
         omega = torch.zeros_like(prod_deg)
+        # Sans ablation (version du papier)
         omega[valid_y_mask] = 1.0 / (prod_deg[valid_y_mask] + eps)
+        # Avec ablation
+        # omega[valid_y_mask] = 1.0
         Mnorm = prod_deg[valid_y_mask].sum() + eps
 
         # A[j,l], C[j,n]

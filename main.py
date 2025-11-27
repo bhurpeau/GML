@@ -124,7 +124,7 @@ def main():
         data, edge_index_XY, edge_index_YZ, w_XY=w_XY, w_YZ=w_YZ,
         epochs=args.epochs,
         device=device,
-        lam_g=0.00020650052914410045,
+        lam_g=1e-3,
         clip_grad=1.0,
         schedule_beta=(2.0, args.beta, args.anneal_step),
         schedule_gamma=(1.0, args.gamma, args.anneal_step),
@@ -166,11 +166,12 @@ def main():
     ids_bat = [inv_bat_map.get(i, f"unk_{i}") for i in range(len(hard))]
 
     os.makedirs("out", exist_ok=True)
-    pd.DataFrame({
+    df_results = pd.DataFrame({
         "id_bat": ids_bat,
         "community": hard
-    }).to_csv(args.out_csv, index=False)
-
+    })
+    df_results = df_results.assign(id_bat=df_results['id_bat'].str.split('/')).explode('id_bat')
+    df_results.to_csv(args.out_csv, index=False)
     print(f"Résultats écrits dans {args.out_csv}")
 
 
