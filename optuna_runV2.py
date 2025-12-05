@@ -31,30 +31,44 @@ def maybe_pick_scalar_weight(edge_attr):
 
 def load_data(device):
     print("=== Chargement des données pour Optuna ===")
-    gdf_bat, gdf_par, gdf_ban, df_ban_links, df_parcelle_links = create_golden_datasets()
+    gdf_bat, gdf_par, gdf_ban, df_ban_links, df_parcelle_links = (
+        create_golden_datasets()
+    )
     data, bat_map = build_graph_from_golden_datasets(
         gdf_bat, gdf_par, gdf_ban, df_ban_links, df_parcelle_links
     )
 
     # On envoie tout sur le device une bonne fois pour toutes si possible
-    X = data['adresse'].x.size(0)
-    Y = data['bâtiment'].x.size(0)
-    Z = data['parcelle'].x.size(0)
+    X = data["adresse"].x.size(0)
+    Y = data["bâtiment"].x.size(0)
+    Z = data["parcelle"].x.size(0)
 
     edge_index_XY = data[XY_KEY].edge_index.to(device)
     edge_index_YZ = data[YZ_KEY].edge_index.to(device)
-    w_XY = maybe_pick_scalar_weight(getattr(data[XY_KEY], 'edge_attr', None))
-    w_YZ = maybe_pick_scalar_weight(getattr(data[YZ_KEY], 'edge_attr', None))
+    w_XY = maybe_pick_scalar_weight(getattr(data[XY_KEY], "edge_attr", None))
+    w_YZ = maybe_pick_scalar_weight(getattr(data[YZ_KEY], "edge_attr", None))
 
-    if w_XY is not None: w_XY = w_XY.to(device)
-    if w_YZ is not None: w_YZ = w_YZ.to(device)
+    if w_XY is not None:
+        w_XY = w_XY.to(device)
+    if w_YZ is not None:
+        w_YZ = w_YZ.to(device)
 
     node_feature_sizes = {nt: data[nt].x.size(1) for nt in data.node_types}
 
     # IMPORTANT : On récupère les métadonnées pour HeteroGNN dynamique
     metadata = data.metadata()
 
-    return data, bat_map, metadata, node_feature_sizes, (X, Y, Z), edge_index_XY, edge_index_YZ, w_XY, w_YZ
+    return (
+        data,
+        bat_map,
+        metadata,
+        node_feature_sizes,
+        (X, Y, Z),
+        edge_index_XY,
+        edge_index_YZ,
+        w_XY,
+        w_YZ,
+    )
 
 
 def build_model(metadata, node_feature_sizes, L, M, N, emb_dim, hidden, device):
@@ -65,7 +79,7 @@ def build_model(metadata, node_feature_sizes, L, M, N, emb_dim, hidden, device):
         num_layers=2,
         metadata=metadata,
         node_feature_sizes=node_feature_sizes,
-        edge_feature_size=2
+        edge_feature_size=2,
     ).to(device)
 
     heads = TripletHeads(dim=emb_dim, L=L, M=M, N=N).to(device)
@@ -73,8 +87,17 @@ def build_model(metadata, node_feature_sizes, L, M, N, emb_dim, hidden, device):
 
 
 def objective(trial, cache, device, epochs):
-    (data, bat_map, metadata, node_feature_sizes, (X, Y, Z),
-     edge_index_XY, edge_index_YZ, w_XY, w_YZ) = cache
+    (
+        data,
+        bat_map,
+        metadata,
+        node_feature_sizes,
+        (X, Y, Z),
+        edge_index_XY,
+        edge_index_YZ,
+        w_XY,
+        w_YZ,
+    ) = cache
 
     # === ESPACE DE RECHERCHE AJUSTÉ (Post-Fix) ===
 
@@ -102,28 +125,44 @@ def objective(trial, cache, device, epochs):
     emb_dim = 64
     hidden = 64
 
-    model, heads = build_model(metadata, node_feature_sizes, L, M, N, emb_dim, hidden, device)
+    model, heads = build_model(
+        metadata, node_feature_sizes, L, M, N, emb_dim, hidden, device
+    )
 
     criterion = DMoN3P(
-        num_X=X, num_Y=Y, num_Z=Z,
-        L=L, M=M, N=N,
-        beta=beta_start, gamma=1.0,
+        num_X=X,
+        num_Y=Y,
+        num_Z=Z,
+        L=L,
+        M=M,
+        N=N,
+        beta=beta_start,
+        gamma=1.0,
         entropy_weight=entropy_weight,
-        lambda_X=lambda_collapse, lambda_Y=lambda_collapse, lambda_Z=lambda_collapse,
-        m_chunk=256
+        lambda_X=lambda_collapse,
+        lambda_Y=lambda_collapse,
+        lambda_Z=lambda_collapse,
+        m_chunk=256,
     ).to(device)
 
     # L'optimiseur sera réinitialisé dans train_dmon3p, mais il faut l'initier
     optimizer = torch.optim.Adam(
-        list(model.parameters()) + list(heads.parameters()),
-        lr=lr, weight_decay=0.0
+        list(model.parameters()) + list(heads.parameters()), lr=lr, weight_decay=0.0
     )
 
     try:
         res = train_dmon3p(
-            model, heads, criterion, optimizer,
-            data, edge_index_XY, edge_index_YZ, w_XY=w_XY, w_YZ=w_YZ,
-            epochs=epochs, device=device,
+            model,
+            heads,
+            criterion,
+            optimizer,
+            data,
+            edge_index_XY,
+            edge_index_YZ,
+            w_XY=w_XY,
+            w_YZ=w_YZ,
+            epochs=epochs,
+            device=device,
             lam_g=1e-3,
             clip_grad=1.0,
             schedule_beta=(beta_start, beta_max, 10),
@@ -131,8 +170,9 @@ def objective(trial, cache, device, epochs):
             anneal_delay_epoch=0,
             prune_every=prune_every,
             prune_delay_epoch=prune_delay_ep,
-            m_chunk=256, use_amp=False,
-            trial=trial
+            m_chunk=256,
+            use_amp=False,
+            trial=trial,
         )
     except Exception as e:
         if str(e) == "OPTUNA_PRUNE":
@@ -165,7 +205,9 @@ def objective(trial, cache, device, epochs):
 
 def main():
     parser = argparse.ArgumentParser("Optuna search for DMoN-3p")
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument(
+        "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu"
+    )
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--trials", type=int, default=30)
     parser.add_argument("--storage", type=str, default="sqlite:///optuna_polygon.db")
@@ -183,7 +225,7 @@ def main():
         pruner=pruner,
         storage=args.storage,
         study_name="dmon3p_geo_v1",
-        load_if_exists=True
+        load_if_exists=True,
     )
 
     def _objective(trial):

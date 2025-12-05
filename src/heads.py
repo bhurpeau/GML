@@ -5,7 +5,8 @@ import torch
 import torch.nn as nn
 
 
-def inv_sigmoid(p): return math.log(p) - math.log(1-p)
+def inv_sigmoid(p):
+    return math.log(p) - math.log(1 - p)
 
 
 class TripletHeads(nn.Module):

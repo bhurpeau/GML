@@ -17,6 +17,7 @@ dependencies = [
     "scipy>=1.16.2",
     "optuna>=4.5.0",
     "matplotlib>=3.10.7",
+    "black>=25.11.0",
 ]
 
 [dependency-groups]

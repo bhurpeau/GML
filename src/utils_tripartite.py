@@ -2,14 +2,18 @@
 #!/usr/bin/env python
 import torch
 
-XY_KEY = ('adresse',  'accès',      'bâtiment')
-YZ_KEY = ('bâtiment', 'appartient', 'parcelle')
+XY_KEY = ("adresse", "accès", "bâtiment")
+YZ_KEY = ("bâtiment", "appartient", "parcelle")
+
 
 def get_xy_yz(edge_index_dict):
     if XY_KEY not in edge_index_dict or YZ_KEY not in edge_index_dict:
-        raise KeyError(f"Relations requises absentes. Attendu {XY_KEY} et {YZ_KEY}. "
-                       f"Disponibles: {list(edge_index_dict.keys())}")
+        raise KeyError(
+            f"Relations requises absentes. Attendu {XY_KEY} et {YZ_KEY}. "
+            f"Disponibles: {list(edge_index_dict.keys())}"
+        )
     return edge_index_dict[XY_KEY], edge_index_dict[YZ_KEY]
+
 
 def get_weight(weights_dict, key, edge_index, device, dtype):
     if weights_dict is None or key not in weights_dict:

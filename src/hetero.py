@@ -3,8 +3,17 @@
 import torch
 from torch_geometric.nn import HeteroConv, GATv2Conv, Linear
 
+
 class HeteroGNN(torch.nn.Module):
-    def __init__(self, hidden_channels, out_channels, num_layers, metadata, node_feature_sizes, edge_feature_size):
+    def __init__(
+        self,
+        hidden_channels,
+        out_channels,
+        num_layers,
+        metadata,
+        node_feature_sizes,
+        edge_feature_size,
+    ):
         """
         Args:
             metadata: tuple (node_types, edge_types) provenant de data.metadata()
@@ -20,35 +29,43 @@ class HeteroGNN(torch.nn.Module):
         # Fonction locale pour déterminer si une arête a des attributs
         def get_edge_dim(rel_type):
             src, rel, dst = rel_type
-            if rel == 'spatial' and (src == 'bâtiment' or src == 'parcelle'):
+            if rel == "spatial" and (src == "bâtiment" or src == "parcelle"):
                 return 1
-            if src == 'adresse' and rel == 'spatial':
+            if src == "adresse" and rel == "spatial":
                 return None
             return edge_feature_size
 
         # --- 1. Couche d'entrée ---
         # Crée dynamiquement une convolution pour CHAQUE type d'arête présent dans data
         in_conv_dict = {
-            rel: GATv2Conv((-1, -1), hidden_channels, add_self_loops=False, 
-                           edge_dim=get_edge_dim(rel))
+            rel: GATv2Conv(
+                (-1, -1),
+                hidden_channels,
+                add_self_loops=False,
+                edge_dim=get_edge_dim(rel),
+            )
             for rel in self.edge_types
         }
-        self.convs.append(HeteroConv(in_conv_dict, aggr='sum'))
+        self.convs.append(HeteroConv(in_conv_dict, aggr="sum"))
 
         # --- 2. Couches cachées ---
         for _ in range(num_layers - 1):
             hidden_conv_dict = {
-                rel: GATv2Conv(hidden_channels, hidden_channels, add_self_loops=False,
-                               edge_dim=get_edge_dim(rel))
+                rel: GATv2Conv(
+                    hidden_channels,
+                    hidden_channels,
+                    add_self_loops=False,
+                    edge_dim=get_edge_dim(rel),
+                )
                 for rel in self.edge_types
             }
-            self.convs.append(HeteroConv(hidden_conv_dict, aggr='sum'))
+            self.convs.append(HeteroConv(hidden_conv_dict, aggr="sum"))
 
         # --- 3. Couche de sortie (Projection linéaire) ---
         # Une couche linéaire par type de nœud pour projeter vers l'embedding final
-        self.lin = torch.nn.ModuleDict({
-            node_type: Linear(-1, out_channels) for node_type in self.node_types
-        })
+        self.lin = torch.nn.ModuleDict(
+            {node_type: Linear(-1, out_channels) for node_type in self.node_types}
+        )
 
     def forward(self, x_dict, edge_index_dict, edge_attr_dict):
         for conv in self.convs:
@@ -60,10 +77,10 @@ class HeteroGNN(torch.nn.Module):
                     edge_attr_dict_conv[rel] = edge_attr_dict[rel]
                 else:
                     edge_attr_dict_conv[rel] = None
-            
+
             # Convolution hétérogène
             x_dict = conv(x_dict, edge_index_dict, edge_attr_dict_conv)
-            
+
             # Activation ReLU
             x_dict = {key: x.relu() for key, x in x_dict.items()}
 
