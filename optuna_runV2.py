@@ -103,21 +103,21 @@ def objective(trial, cache, device, epochs):
 
     # 1. Régularisation (Critique car l'optimiseur est plus fort maintenant)
     # On permet d'aller chercher plus haut pour éviter l'effondrement
-    lambda_collapse = trial.suggest_float("lambda_collapse", 1e-4, 1.0, log=True)
-    entropy_weight = trial.suggest_float("entropy_weight", 1e-4, 1e-2, log=True)
+    lambda_collapse = trial.suggest_float("lambda_collapse", 5e-4, 5e-2, log=True)
+    entropy_weight = trial.suggest_float("entropy_weight", 2e-4, 2e-3, log=True)
 
     # 2. Dynamique d'apprentissage
-    lr = trial.suggest_float("lr", 1e-4, 5e-3, log=True)
+    lr = trial.suggest_float("lr", 5e-4, 3e-3, log=True)
 
     # 3. Paramètres DMoN
     # Beta un peu plus large pour tester la dureté de l'assignation sur graphe propre
     beta_start = 2.0
-    beta_max = trial.suggest_float("beta_max", 3.0, 8.0)
+    beta_max = trial.suggest_float("beta_max", 5.0, 8.0)
 
     # 4. Pruning
     # Pruner trop tôt avec le reset d'optimiseur peut être instable.
     # On teste si on attend un peu plus longtemps.
-    prune_delay_ep = trial.suggest_categorical("prune_delay_epoch", [40, 60, 80])
+    prune_delay_ep = trial.suggest_categorical("prune_delay_epoch", [60, 80, 100])
     prune_every = trial.suggest_categorical("prune_every", [10, 20])
 
     # Tailles fixes (pour comparer ce qui est comparable)
@@ -211,6 +211,7 @@ def main():
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--trials", type=int, default=30)
     parser.add_argument("--storage", type=str, default="sqlite:///optuna_polygon.db")
+    parser.add_argument("--study_name", type=str, default="optuna_search")
     args = parser.parse_args()
 
     device = args.device
@@ -224,7 +225,7 @@ def main():
         sampler=sampler,
         pruner=pruner,
         storage=args.storage,
-        study_name="dmon3p_geo_v1",
+        study_name=args.study_name,
         load_if_exists=True,
     )
 

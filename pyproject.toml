@@ -18,6 +18,9 @@ dependencies = [
     "optuna>=4.5.0",
     "matplotlib>=3.10.7",
     "black>=25.11.0",
+    "pyarrow>=22.0.0",
+    "fastparquet>=2024.11.0",
+    "bs4>=0.0.2",
 ]
 
 [dependency-groups]

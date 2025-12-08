@@ -8,6 +8,8 @@ import torch
 import hdbscan
 import networkx as nx
 import torch_geometric.utils
+import optuna
+from sklearn.neighbors import NearestNeighbors
 from torch_geometric.data import HeteroData
 from sklearn.preprocessing import MinMaxScaler, normalize
 from torch_geometric.nn import knn_graph
@@ -336,27 +338,52 @@ def prepare_node_features(gdf_bat, gdf_par, gdf_ban):
     bat_features["ffo_bat_nb_log"] = pd.to_numeric(
         bat_features["ffo_bat_nb_log"], errors="coerce"
     ).fillna(median_logs)
+
     bat_features["bdtopo_bat_l_usage_1"] = bat_features["bdtopo_bat_l_usage_1"].fillna(
         "Inconnu"
     )
     bat_features["surface"] = bat_features.geometry.area
+
+    # ------------------------------------------------------------------
+    # Minéralité / densité locale du bâti (facteur d'environnement)
+    # ------------------------------------------------------------------
+    print("  - Calcul de la densité locale de bâti (approx. minéralité)...")
+    # Centroïdes des bâtiments en coordonnées projetées (EPSG:2154)
+    centroids = bat_features.geometry.centroid
+    coords = np.vstack([centroids.x.values, centroids.y.values]).T
+
+    # On prend, par exemple, les 16 plus proches voisins (K=16)
+    K_DENSITY = 16
+    nn = NearestNeighbors(n_neighbors=K_DENSITY + 1, algorithm="ball_tree")
+    nn.fit(coords)
+    distances, _ = nn.kneighbors(coords)
+
+    # On ignore la distance 0 au bâtiment lui-même et on moyenne sur les voisins
+    mean_nn_dist = distances[:, 1:].mean(axis=1)
+    local_density = 1.0 / (mean_nn_dist + 1e-6)
+
+    bat_features["local_density"] = local_density
 
     # Encodage One-Hot des features bâtiment
     categorical_feats = ["bdtopo_bat_l_usage_1", "decennie_construction"]
     one_hot_encoded = pd.get_dummies(
         bat_features[categorical_feats], prefix=["usage", "decennie"], dtype=int
     )
-    numerical_feats = ["surface", "ffo_bat_nb_log"]
+
+    # On ajoute local_density aux variables numériques
+    numerical_feats = ["surface", "ffo_bat_nb_log", "local_density"]
     scaled_numerical = scaler.fit_transform(bat_features[numerical_feats])
     scaled_numerical_df = pd.DataFrame(
         scaled_numerical, columns=numerical_feats, index=bat_features.index
     )
+
     # Morphologie des bâtiments
     shape_feats_bat = compute_shape_features(gdf_bat)
     scaled_shape_bat = scaler.fit_transform(shape_feats_bat)
     scaled_shape_bat_df = pd.DataFrame(
         scaled_shape_bat, columns=shape_feats_bat.columns, index=gdf_bat.index
     )
+
     final_bat_features_df = pd.concat(
         [scaled_numerical_df, one_hot_encoded, scaled_shape_bat_df], axis=1
     )
@@ -677,3 +704,14 @@ def perform_geographic_subclustering(gdf_par, building_parcel_links, communities
     if not final_assignments:
         return pd.DataFrame(columns=["id_bat", "final_community"])
     return pd.concat(final_assignments, ignore_index=True)
+
+
+def load_best_params_from_optuna(storage_url: str, study_name: str):
+    study = optuna.load_study(
+        storage=storage_url,
+        study_name=study_name,
+    )
+    best = study.best_trial
+    print(f"Best value: {best.value}")
+    print(f"Best params: {best.params}")
+    return best.params

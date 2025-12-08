@@ -15,4 +15,4 @@ uv pip install torch-cluster torch-scatter torch-sparse -f https://data.pyg.org/
 python -m ipykernel install --user --name=venv-gml --display-name "Python (.venv GML)"
 mkdir ./data
 mkdir ./out
-mc cp -r  s3/bhurpeau/graphe/data/ data/
+mc cp -r  s3/bhurpeau/graphe/WP2/data/ data/
