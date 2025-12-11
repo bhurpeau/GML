@@ -1,6 +1,19 @@
 #!/usr/bin/env python
 # 01_fetch_data.py
 
+"""
+Récupère les données issues des sources BDTOPO, Cadastre, RNB, BDNB et BAN.
+
+Pour chaque département, on dépose sur s3 :
+
+    {s3_root}/RNB/{dep}/RNB_{dep}.parquet
+    {s3_root}/BDTOPO/{dep}/bdtopo-{dep}.parquet
+    {s3_root}/BDNB/{dep}/bdnb-construction-{dep}.parquet
+    {s3_root}/BDNB/{dep}/bdnb-groupe-{dep}.parquet
+    {s3_root}/CADASTRE/{dep}/cadastre-{dep}-parcelles.parquet
+    {s3_root}/BAN/{dep}/adresses-{dep}.parquet
+"""
+
 import boto3
 from botocore.exceptions import ClientError
 from urllib.parse import urlparse
@@ -157,19 +170,20 @@ def connect_duckdb():
     con.execute("SET s3_use_ssl=true;")
     return con
 
+
 def check_s3_exists(s3_uri: str) -> bool:
     """Vérifie si un fichier existe sur S3 sans le télécharger (HEAD request)."""
     parsed = urlparse(s3_uri)
     bucket = parsed.netloc
-    key = parsed.path.lstrip('/')
+    key = parsed.path.lstrip("/")
 
     s3 = boto3.client(
-        's3',
-        endpoint_url='https://'+os.environ.get('AWS_S3_ENDPOINT'),
-        aws_access_key_id=os.environ.get('AWS_ACCESS_KEY_ID'),
-        aws_secret_access_key=os.environ.get('AWS_SECRET_ACCESS_KEY'),
-        aws_session_token=os.environ.get('AWS_SESSION_TOKEN'),
-        region_name=os.environ.get('AWS_DEFAULT_REGION', 'us-east-1')
+        "s3",
+        endpoint_url="https://" + os.environ.get("AWS_S3_ENDPOINT"),
+        aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
+        aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
+        aws_session_token=os.environ.get("AWS_SESSION_TOKEN"),
+        region_name=os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
     )
 
     try:
@@ -358,8 +372,8 @@ def fetch_cadastre_dep_to_s3(dep: str, s3_root: str):
     url = f"{CADASTRE_BASE}/{dep}/cadastre-{dep}-parcelles.json.gz"
     s3_uri = f"{s3_root}/CADASTRE/{dep}/cadastre-{dep}-parcelles.parquet"
     if check_s3_exists(s3_uri):
-            print(f"[SKIP] Cadastre {dep} existe déjà sur S3 ({s3_uri})")
-            return
+        print(f"[SKIP] Cadastre {dep} existe déjà sur S3 ({s3_uri})")
+        return
     con = connect_duckdb()
     con.execute(
         f"""
@@ -458,7 +472,7 @@ def fetch_bdnb_dep_to_s3(dep: str, s3_root: str):
         ["batiment_construction_id", "batiment_groupe_id"]
     ]
     gdf_groupe_compile = gpd.read_file(gpkg_path, layer="batiment_groupe_compile")
-    
+
     # gdf_construction = gdf_construction.to_crs(TARGET_CRS)
     # gdf_groupe_compile = gdf_groupe_compile.to_crs(TARGET_CRS)
 
@@ -476,8 +490,10 @@ def fetch_bdnb_dep_to_s3(dep: str, s3_root: str):
         SELECT * FROM read_parquet('{local_parquet_1.as_posix()}');
     """
     )
-    
-    con.execute(f"COPY bdnb_construction_{dep} TO '{s3_uri_construction}' (FORMAT PARQUET);")
+
+    con.execute(
+        f"COPY bdnb_construction_{dep} TO '{s3_uri_construction}' (FORMAT PARQUET);"
+    )
 
     con.execute(
         f"""
@@ -485,7 +501,7 @@ def fetch_bdnb_dep_to_s3(dep: str, s3_root: str):
         SELECT * FROM read_parquet('{local_parquet_2.as_posix()}');
     """
     )
-    
+
     con.execute(f"COPY bdnb_groupe_{dep} TO '{s3_uri_groupe}' (FORMAT PARQUET);")
     print(f"[OK] BDNB {dep} -> {s3_uri_construction} / {s3_uri_groupe}")
 
