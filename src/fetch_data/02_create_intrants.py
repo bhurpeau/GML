@@ -178,6 +178,7 @@ def create_intrants_for_dep(dep: str, s3_root: str):
         json.dump(meta, f, indent=2, ensure_ascii=False)
 
     print(f"[OK] Intrants créés pour le département {dep} → {out_dir}")
+
     # ------------------------------------------------------------------
     # 8. Export des intrants vers S3
     # ------------------------------------------------------------------
