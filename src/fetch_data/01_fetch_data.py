@@ -40,6 +40,7 @@ if str(ROOT / "src") not in sys.path:
     sys.path.append(str(ROOT / "src"))
 
 from io import connect_duckdb
+
 # ---------------------------------------------------------------------
 # CONFIG GLOBALE
 # ---------------------------------------------------------------------
@@ -416,6 +417,7 @@ def fetch_cadastre_dep_to_s3(dep: str, s3_root: str):
     con.execute(f"COPY cadastre_{dep} TO '{s3_uri}' (FORMAT PARQUET);")
     print(f"[OK] Cadastre {dep} → {s3_uri}")
     shutil.rmtree(DATA_RAW, ignore_errors=True)
+
 
 # ---------------------------------------------------------------------
 # RNB

@@ -32,13 +32,14 @@ K_SPATIAL = 8
 # OUTILS GÉNÉRIQUES
 # ============================================================
 
+
 def fourier_features(coords: torch.Tensor, num_bands: int = 4) -> torch.Tensor:
     """
     Encodage de Fourier pour coordonnées spatiales
     """
     features = [coords]
     for i in range(num_bands):
-        freq = 2.0 ** i
+        freq = 2.0**i
         features.append(torch.sin(freq * coords))
         features.append(torch.cos(freq * coords))
     return torch.cat(features, dim=1)
@@ -47,6 +48,7 @@ def fourier_features(coords: torch.Tensor, num_bands: int = 4) -> torch.Tensor:
 # ============================================================
 # RNB – PARSING DES LIENS
 # ============================================================
+
 
 def parse_rnb_links(df_rnb: pd.DataFrame):
     """
@@ -108,6 +110,7 @@ def parse_rnb_links(df_rnb: pd.DataFrame):
 # MORPHOLOGIE DES POLYGONES
 # ============================================================
 
+
 def compute_shape_features(gdf: gpd.GeoDataFrame) -> pd.DataFrame:
     """
     Descripteurs morphologiques standards (2D)
@@ -116,7 +119,7 @@ def compute_shape_features(gdf: gpd.GeoDataFrame) -> pd.DataFrame:
     area = geom.area
     perimeter = geom.length
 
-    compactness = (4 * np.pi * area) / (perimeter ** 2 + 1e-6)
+    compactness = (4 * np.pi * area) / (perimeter**2 + 1e-6)
     convexity = area / (geom.convex_hull.area + 1e-6)
 
     def elong(poly):
@@ -146,6 +149,7 @@ def compute_shape_features(gdf: gpd.GeoDataFrame) -> pd.DataFrame:
 # ============================================================
 # FEATURES NŒUDS
 # ============================================================
+
 
 def prepare_node_features(
     gdf_bat: gpd.GeoDataFrame,
@@ -184,7 +188,9 @@ def prepare_node_features(
     bins = list(range(1800, 2031, 10))
     labels = [f"dec_{b}" for b in bins[:-1]]
     gdf_bat["decennie"] = pd.cut(gdf_bat["year"], bins=bins, labels=labels)
-    gdf_bat["decennie"] = gdf_bat["decennie"].cat.add_categories("Inconnu").fillna("Inconnu")
+    gdf_bat["decennie"] = (
+        gdf_bat["decennie"].cat.add_categories("Inconnu").fillna("Inconnu")
+    )
 
     # Nb logements
     gdf_bat["nb_logements"] = pd.to_numeric(
@@ -195,9 +201,7 @@ def prepare_node_features(
     gdf_bat["usage"] = gdf_bat.get("bdtopo_bat_l_usage_1", "Inconnu").fillna("Inconnu")
 
     # Densité locale (minéralité)
-    coords = np.vstack(
-        [gdf_bat.geometry.centroid.x, gdf_bat.geometry.centroid.y]
-    ).T
+    coords = np.vstack([gdf_bat.geometry.centroid.x, gdf_bat.geometry.centroid.y]).T
     nn = NearestNeighbors(n_neighbors=K_DENSITY + 1)
     nn.fit(coords)
     dist, _ = nn.kneighbors(coords)
@@ -268,6 +272,7 @@ def prepare_node_features(
 # PROJECTION PARCELLE → BÂTIMENT
 # ============================================================
 
+
 def project_building_adjacency_sparse(
     num_bat, num_par, edge_index_bp, edge_index_pp, weights_pp
 ):
@@ -296,6 +301,7 @@ def project_building_adjacency_sparse(
 # CONSTRUCTION DU GRAPHE
 # ============================================================
 
+
 def build_graph_from_golden_datasets(
     gdf_bat, gdf_par, gdf_ban, df_ban_links, df_par_links
 ):
@@ -323,9 +329,9 @@ def build_graph_from_golden_datasets(
 
     weights = []
     for i, j in zip(sjoin.index_left, sjoin.index_right):
-        weights.append(gdf_par.geometry.iloc[i].intersection(
-            gdf_par.geometry.iloc[j]
-        ).length)
+        weights.append(
+            gdf_par.geometry.iloc[i].intersection(gdf_par.geometry.iloc[j]).length
+        )
 
     edge_pp = torch.tensor([src, dst])
     weights_pp = torch.tensor(weights)
@@ -365,6 +371,7 @@ def build_graph_from_golden_datasets(
 # ============================================================
 # OPTUNA
 # ============================================================
+
 
 def load_best_params_from_optuna(storage_url: str, study_name: str):
     study = optuna.load_study(storage=storage_url, study_name=study_name)

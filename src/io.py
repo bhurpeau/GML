@@ -17,12 +17,15 @@ def connect_duckdb():
     con.execute("SET s3_use_ssl=true;")
     return con
 
+
 def read_parquet_s3_as_df(con: duckdb.DuckDBPyConnection, uri: str):
     """Lit un Parquet (tabulaire) sur S3 et renvoie un DataFrame pandas."""
     return con.execute("SELECT * FROM read_parquet(?)", [uri]).df()
 
 
-def read_parquet_s3_as_gdf(con: duckdb.DuckDBPyConnection, uri: str) -> gpd.GeoDataFrame:
+def read_parquet_s3_as_gdf(
+    con: duckdb.DuckDBPyConnection, uri: str
+) -> gpd.GeoDataFrame:
     """
     Lit un Parquet écrit par GeoPandas sur S3 (GeoParquet) et reconstruit un GeoDataFrame.
     On suppose une colonne 'geometry' en WKB.

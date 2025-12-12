@@ -31,6 +31,8 @@ from utils import (  # type: ignore  # noqa: E402
     build_graph_from_golden_datasets,
 )
 from io import connect_duckdb, read_parquet_s3_as_df, read_parquet_s3_as_gdf
+
+
 # -----------------------------------------------------------------------------
 # 2. Construction du graphe pour un département
 # -----------------------------------------------------------------------------

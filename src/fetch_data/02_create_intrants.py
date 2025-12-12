@@ -30,6 +30,7 @@ if str(ROOT / "src") not in sys.path:
 
 from utils import TARGET_CRS, perform_semantic_sjoin, parse_rnb_links
 from io import connect_duckdb, read_parquet_s3_as_df, read_parquet_s3_as_gdf
+
 # ---------------------------------------------------------------------
 # CONFIG LOCALE
 # ---------------------------------------------------------------------
@@ -146,7 +147,7 @@ def create_intrants_for_dep(dep: str, s3_root: str):
         "ffo_bat_annee_construction",
         "bdtopo_bat_l_usage_1",
         "ffo_bat_nb_log",
-        "code_commune_insee"
+        "code_commune_insee",
     ]
     df_groupe_subset = gdf_groupe_compile[features_to_keep].drop_duplicates(
         subset=["batiment_groupe_id"]
@@ -233,17 +234,12 @@ def create_intrants_for_dep(dep: str, s3_root: str):
         s3_uri = f"{s3_intrants_root}/{dep}/{fname}"
         print(s3_uri)
         import subprocess
-        subprocess.run([
-            "mc", "cp",
-            str(local_path),
-            s3_uri
-        ])
+
+        subprocess.run(["mc", "cp", str(local_path), s3_uri])
         print(f"   [OK] {fname} → {s3_uri}")
 
     print(f"[OK] Intrants exportés sur S3 pour le département {dep}")
     shutil.rmtree(out_dir, ignore_errors=True)
-
-
 
 
 if __name__ == "__main__":
