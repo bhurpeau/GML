@@ -33,7 +33,13 @@ from pathlib import Path
 from bs4 import BeautifulSoup
 from tqdm import tqdm
 
+ROOT = Path(__file__).resolve().parents[2]  # /home/onyxia/work/GML typiquement
+import sys
 
+if str(ROOT / "src") not in sys.path:
+    sys.path.append(str(ROOT / "src"))
+
+from io import connect_duckdb
 # ---------------------------------------------------------------------
 # CONFIG GLOBALE
 # ---------------------------------------------------------------------
@@ -369,21 +375,47 @@ def fetch_ban_dep_to_s3(dep: str, s3_root: str):
 # ---------------------------------------------------------------------
 def fetch_cadastre_dep_to_s3(dep: str, s3_root: str):
     dep = dep.zfill(2)
+
     url = f"{CADASTRE_BASE}/{dep}/cadastre-{dep}-parcelles.json.gz"
-    s3_uri = f"{s3_root}/CADASTRE/{dep}/cadastre-{dep}-parcelles.parquet"
-    if check_s3_exists(s3_uri):
-        print(f"[SKIP] Cadastre {dep} existe déjà sur S3 ({s3_uri})")
-        return
+
+    print(f"[INFO] Téléchargement Cadastre {dep}")
+    base_dir = DATA_RAW / "CADASTRE" / dep
+    base_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Télécharger le .json.gz
+    gz_path = base_dir / f"cadastre-{dep}-parcelles.json.gz"
+    json_path = base_dir / f"cadastre-{dep}-parcelles.json"
+    parquet_path = base_dir / f"cadastre-{dep}-parcelles.parquet"
+
+    # stream_download est ta fonction existante
+    stream_download(url, gz_path)
+
+    # 2. Décompression .gz → .geojson
+    print(" → Décompression du GeoJSON.gz")
+    with gzip.open(gz_path, "rb") as f_in, open(json_path, "wb") as f_out:
+        shutil.copyfileobj(f_in, f_out)
+
+    # 3. Lecture avec GeoPandas
+    print(" → Lecture du GeoJSON avec GeoPandas")
+    gdf = gpd.read_file(json_path)
+    gdf = gdf.to_crs("EPSG:2154")  # ou TARGET_CRS si tu préfères centraliser
+
+    # 4. Écriture GeoParquet local
+    print(" → Écriture GeoParquet local")
+    gdf.to_parquet(parquet_path)
+
+    # 5. Envoi vers S3 via DuckDB
     con = connect_duckdb()
+    s3_uri = f"{s3_root}/CADASTRE/{dep}/cadastre-{dep}-parcelles.parquet"
     con.execute(
         f"""
         CREATE OR REPLACE TABLE cadastre_{dep} AS
-        SELECT * FROM read_json_auto('{url}', maximum_object_size=1073741824);
+        SELECT * FROM read_parquet('{parquet_path.as_posix()}');
     """
     )
     con.execute(f"COPY cadastre_{dep} TO '{s3_uri}' (FORMAT PARQUET);")
-    print(f"[OK] Cadastre {dep} -> {s3_uri}")
-
+    print(f"[OK] Cadastre {dep} → {s3_uri}")
+    shutil.rmtree(DATA_RAW, ignore_errors=True)
 
 # ---------------------------------------------------------------------
 # RNB

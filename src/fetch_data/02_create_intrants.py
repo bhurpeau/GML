@@ -14,43 +14,28 @@ Pour chaque département, on produit en LOCAL :
     data/intrants/<dep>/parcelle_links.parquet
 """
 
-import os
 import sys
 import json
 from pathlib import Path
-
+import shutil
 import duckdb
 import pandas as pd
 import geopandas as gpd
 from shapely import wkb
 
-# ---- pour que "from src.utils import ..." fonctionne même depuis src/fetch_data ----
-ROOT = Path(__file__).resolve().parents[2]  # .../GML
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+ROOT = Path(__file__).resolve().parents[2]  # /home/onyxia/work/GML typiquement
 
-from src.utils import TARGET_CRS, perform_semantic_sjoin, parse_rnb_links
+if str(ROOT / "src") not in sys.path:
+    sys.path.append(str(ROOT / "src"))
 
+from utils import TARGET_CRS, perform_semantic_sjoin, parse_rnb_links
+from io import connect_duckdb, read_parquet_s3_as_df, read_parquet_s3_as_gdf
 # ---------------------------------------------------------------------
 # CONFIG LOCALE
 # ---------------------------------------------------------------------
 DATA_INTRANTS = Path("/home/onyxia/work/GML/data/intrants")
-PLU_PATH = "/home/onyxia/work/GML/data/PLU/DU_75.gpkg"   # à adapter si besoin
+PLU_PATH = "/home/onyxia/work/GML/data/wfs_du.gpkg"  # à adapter si besoin
 DATA_INTRANTS.mkdir(parents=True, exist_ok=True)
-
-
-def connect_duckdb():
-    con = duckdb.connect()
-    con.execute("INSTALL httpfs; LOAD httpfs;")
-    con.execute(f"SET s3_endpoint='{os.environ['AWS_S3_ENDPOINT']}';")
-    con.execute(f"SET s3_region='{os.environ.get('AWS_DEFAULT_REGION', 'us-east-1')}';")
-    con.execute(f"SET s3_access_key_id='{os.environ['AWS_ACCESS_KEY_ID']}';")
-    con.execute(f"SET s3_secret_access_key='{os.environ['AWS_SECRET_ACCESS_KEY']}';")
-    con.execute(f"SET s3_session_token='{os.environ['AWS_SESSION_TOKEN']}';")
-    con.execute("SET s3_url_style='path';")
-    con.execute("SET s3_url_style='path';")
-    con.execute("SET s3_use_ssl=true;")
-    return con
 
 
 def read_parquet_s3_as_df(con: duckdb.DuckDBPyConnection, uri: str) -> pd.DataFrame:
@@ -58,7 +43,9 @@ def read_parquet_s3_as_df(con: duckdb.DuckDBPyConnection, uri: str) -> pd.DataFr
     return con.execute("SELECT * FROM read_parquet(?)", [uri]).df()
 
 
-def read_parquet_s3_as_gdf(con: duckdb.DuckDBPyConnection, uri: str) -> gpd.GeoDataFrame:
+def read_parquet_s3_as_gdf(
+    con: duckdb.DuckDBPyConnection, uri: str
+) -> gpd.GeoDataFrame:
     """
     Lecture d'un Parquet (écrit par GeoPandas) sur S3 via DuckDB,
     et reconstruction du GeoDataFrame (geometry en WKB).
@@ -69,8 +56,19 @@ def read_parquet_s3_as_gdf(con: duckdb.DuckDBPyConnection, uri: str) -> gpd.GeoD
     if "geometry" not in df.columns:
         raise ValueError(f"Pas de colonne 'geometry' dans {uri}")
 
-    geom = gpd.GeoSeries.from_wkb(df["geometry"].apply(lambda x: x if isinstance(x, (bytes, bytearray)) else bytes(x)))
-    gdf = gpd.GeoDataFrame(df.drop(columns=["geometry"]), geometry=geom, crs=TARGET_CRS)
+    def to_bytes(val):
+        if isinstance(val, (bytes, bytearray, memoryview)):
+            return bytes(val)
+        return val
+
+    geom_wkb = df["geometry"].apply(to_bytes)
+
+    geom = gpd.GeoSeries.from_wkb(geom_wkb)
+    gdf = gpd.GeoDataFrame(
+        df.drop(columns=["geometry"]),
+        geometry=geom,
+        crs=TARGET_CRS,
+    )
     return gdf
 
 
@@ -94,16 +92,15 @@ def create_intrants_for_dep(dep: str, s3_root: str):
     # ------------------------------------------------------------------
     # 0. URIs S3 des bruts (mêmes conventions que 01_fetch_data)
     # ------------------------------------------------------------------
-    s3_rnb        = f"{s3_root}/RNB/{dep}/RNB_{dep}.parquet"
-    s3_bdtopo     = f"{s3_root}/BDTOPO/{dep}/bdtopo-{dep}.parquet"
+    s3_rnb = f"{s3_root}/RNB/{dep}/RNB_{dep}.parquet"
+    s3_bdtopo = f"{s3_root}/BDTOPO/{dep}/bdtopo-{dep}.parquet"
     s3_bdnb_const = f"{s3_root}/BDNB/{dep}/bdnb-construction-{dep}.parquet"
     s3_bdnb_group = f"{s3_root}/BDNB/{dep}/bdnb-groupe-{dep}.parquet"
-    s3_parcelles  = f"{s3_root}/CADASTRE/{dep}/cadastre-{dep}-parcelles.parquet"
-    s3_ban        = f"{s3_root}/BAN/{dep}/adresses-{dep}.parquet"
+    s3_parcelles = f"{s3_root}/CADASTRE/{dep}/cadastre-{dep}-parcelles.parquet"
+    s3_ban = f"{s3_root}/BAN/{dep}/adresses-{dep}.parquet"
 
     out_dir = DATA_INTRANTS / dep
     out_dir.mkdir(parents=True, exist_ok=True)
-
     # ------------------------------------------------------------------
     # 1. RNB + liens
     # ------------------------------------------------------------------
@@ -149,14 +146,13 @@ def create_intrants_for_dep(dep: str, s3_root: str):
         "ffo_bat_annee_construction",
         "bdtopo_bat_l_usage_1",
         "ffo_bat_nb_log",
+        "code_commune_insee"
     ]
     df_groupe_subset = gdf_groupe_compile[features_to_keep].drop_duplicates(
         subset=["batiment_groupe_id"]
     )
 
-    gdf_bat = gdf_merged.merge(
-        df_groupe_subset, on="batiment_groupe_id", how="left"
-    )
+    gdf_bat = gdf_merged.merge(df_groupe_subset, on="batiment_groupe_id", how="left")
 
     # ------------------------------------------------------------------
     # 5. Parcelles + PLU
@@ -214,6 +210,40 @@ def create_intrants_for_dep(dep: str, s3_root: str):
         json.dump(meta, f, indent=2, ensure_ascii=False)
 
     print(f"[OK] Intrants créés pour le département {dep} → {out_dir}")
+    # ------------------------------------------------------------------
+    # 8. Export des intrants vers S3
+    # ------------------------------------------------------------------
+    print("→ Export des intrants vers S3")
+    if "/raw" in s3_root:
+        s3_intrants_root = s3_root.replace("/raw", "/intrants").replace("s3://", "s3/")
+    else:
+        # fallback si jamais tu changes ta convention plus tard
+        s3_intrants_root = s3_root + "/intrants"
+        s3_intrants_root = s3_intrants_root.replace("s3://", "s3/")
+
+    files_to_push = {
+        "bat.parquet": out_dir / "bat.parquet",
+        "parcelles.parquet": out_dir / "parcelles.parquet",
+        "ban.parquet": out_dir / "ban.parquet",
+        "ban_links.parquet": out_dir / "ban_links.parquet",
+        "parcelle_links.parquet": out_dir / "parcelle_links.parquet",
+    }
+
+    for fname, local_path in files_to_push.items():
+        s3_uri = f"{s3_intrants_root}/{dep}/{fname}"
+        print(s3_uri)
+        import subprocess
+        subprocess.run([
+            "mc", "cp",
+            str(local_path),
+            s3_uri
+        ])
+        print(f"   [OK] {fname} → {s3_uri}")
+
+    print(f"[OK] Intrants exportés sur S3 pour le département {dep}")
+    shutil.rmtree(out_dir, ignore_errors=True)
+
+
 
 
 if __name__ == "__main__":
