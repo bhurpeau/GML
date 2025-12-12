@@ -1,5 +1,4 @@
-#!/usr/bin/env python3
-# 02_create_intrants.py
+# intrants.py
 
 """
 Construit les GOLDEN DATASETS à partir des données brutes stockées sur S3
@@ -21,21 +20,20 @@ import shutil
 import pandas as pd
 import geopandas as gpd
 
-ROOT = Path(__file__).resolve().parents[2]  # /home/onyxia/work/GML typiquement
-
-if str(ROOT / "src") not in sys.path:
-    sys.path.append(str(ROOT / "src"))
-
 from utils import perform_semantic_sjoin, parse_rnb_links
-from io_data import connect_duckdb, read_parquet_s3_as_df, read_parquet_s3_as_gdf
+from gml.io.duckdb_s3 import (
+    connect_duckdb,
+    read_parquet_s3_as_df,
+    read_parquet_s3_as_gdf,
+)
+from gml.io.paths import DATA_INTRANTS
 
 # ---------------------------------------------------------------------
 # CONFIG LOCALE
 # ---------------------------------------------------------------------
-DATA_INTRANTS = Path("/home/onyxia/work/GML/data/intrants")
+
 PLU_PATH = "/home/onyxia/work/GML/data/wfs_du.gpkg"  # à adapter si besoin
 DATA_INTRANTS.mkdir(parents=True, exist_ok=True)
-TARGET_CRS = "EPSG:2154"
 
 
 def create_intrants_for_dep(dep: str, s3_root: str):

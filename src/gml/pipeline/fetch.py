@@ -31,128 +31,22 @@ import subprocess
 from pathlib import Path
 from bs4 import BeautifulSoup
 from tqdm import tqdm
-
-ROOT = Path(__file__).resolve().parents[2]  # /home/onyxia/work/GML typiquement
-import sys
-
-if str(ROOT / "src") not in sys.path:
-    sys.path.append(str(ROOT / "src"))
-
-from io import connect_duckdb
-
+from gml.io.duckdb_s3 import connect_duckdb
+from gml.io.paths import DATA_RAW
+from gml.config import TARGET_CRS
 # ---------------------------------------------------------------------
 # CONFIG GLOBALE
 # ---------------------------------------------------------------------
-DEP_FRANCE = [
-    "95",
-    "94",
-    "93",
-    "92",
-    "91",
-    "90",
-    "89",
-    "88",
-    "87",
-    "86",
-    "85",
-    "84",
-    "83",
-    "82",
-    "81",
-    "80",
-    "79",
-    "78",
-    "77",
-    "76",
-    "75",
-    "74",
-    "73",
-    "72",
-    "71",
-    "70",
-    "68",
-    "69",
-    "67",
-    "66",
-    "65",
-    "64",
-    "63",
-    "62",
-    "61",
-    "60",
-    "59",
-    "58",
-    "57",
-    "56",
-    "55",
-    "54",
-    "53",
-    "52",
-    "51",
-    "50",
-    "49",
-    "48",
-    "47",
-    "46",
-    "45",
-    "44",
-    "43",
-    "42",
-    "41",
-    "40",
-    "39",
-    "38",
-    "37",
-    "36",
-    "35",
-    "34",
-    "33",
-    "32",
-    "31",
-    "30",
-    "2B",
-    "2A",
-    "29",
-    "28",
-    "27",
-    "26",
-    "25",
-    "24",
-    "23",
-    "22",
-    "21",
-    "19",
-    "18",
-    "17",
-    "16",
-    "15",
-    "14",
-    "13",
-    "12",
-    "11",
-    "10",
-    "09",
-    "08",
-    "07",
-    "06",
-    "05",
-    "04",
-    "03",
-    "02",
-    "01",
-]
-DATA_RAW = Path("data_raw")
+
 
 BDTOPO_PAGE = "https://geoservices.ign.fr/bdtopo"
 BDTOPO_DATE_FILTER = "2025-09"
-BDTOPO_DOWNLOAD_DIR = DATA_RAW / "BDTOPO" / "downloads"
-BDTOPO_UNZIP_DIR = DATA_RAW / "BDTOPO" / "unzipped"
-TARGET_CRS = "EPSG:2154"
-
 BAN_BASE = "https://adresse.data.gouv.fr/data/ban/adresses/2025-06-25/csv"
 CADASTRE_BASE = (
     "https://cadastre.data.gouv.fr/data/etalab-cadastre/2025-09-01/geojson/departements"
 )
+BDTOPO_DOWNLOAD_DIR = DATA_RAW / "BDTOPO" / "downloads"
+BDTOPO_UNZIP_DIR = DATA_RAW / "BDTOPO" / "unzipped"
 
 
 # ---------------------------------------------------------------------

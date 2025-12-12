@@ -1,34 +1,25 @@
 # -*- coding: utf-8 -*-
 """
-03_build_graph_from_golden_datasets.py
-
 Construit le graphe hétérogène tripartite (bâtiment / parcelle / adresse)
 à partir des intrants stockés sur S3, et écrit le graphe sur le S3
 """
 
 import argparse
 import json
-import sys
 from pathlib import Path
 import torch
 import shutil
-
-# -----------------------------------------------------------------------------
-# 1. Raccrocher utils.py (build_graph_from_golden_datasets, TARGET_CRS, ...)
-# -----------------------------------------------------------------------------
-ROOT = Path(__file__).resolve().parents[2]  # /home/onyxia/work/GML typiquement
-if str(ROOT / "src") not in sys.path:
-    sys.path.append(str(ROOT / "src"))
-
-from utils import build_graph_from_golden_datasets
-from io_data import connect_duckdb, read_parquet_s3_as_df, read_parquet_s3_as_gdf
-
-TARGET_CRS = "EPSG:2154"
+from gml.graph.build import build_graph_from_golden_datasets
+from gml.io.duckdb_s3 import connect_duckdb, read_parquet_s3_as_df, read_parquet_s3_as_gdf
+from gml.io.paths import DATA_GRAPHS
+from gml.config import TARGET_CRS
 
 
 # -----------------------------------------------------------------------------
 # 2. Construction du graphe pour un département
 # -----------------------------------------------------------------------------
+
+
 def build_graph_for_dep(dep: str, s3_intrants_root: str, out_root: Path):
     dep = dep.zfill(2)
     print(f"\n=== Construction du graphe pour le département {dep} ===")
@@ -139,7 +130,7 @@ def main():
     )
     parser.add_argument(
         "--out-dir",
-        default=str(ROOT / "data" / "graphs"),
+        default=str(DATA_GRAPHS),
         help="Répertoire local de sortie des graphes (par défaut: data/graphs)",
     )
 
