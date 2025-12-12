@@ -22,7 +22,6 @@ import zipfile
 import io
 import gzip
 import tempfile
-import duckdb
 import geopandas as gpd
 import requests
 import os
@@ -162,20 +161,6 @@ CADASTRE_BASE = (
 def run(cmd):
     print(">>", " ".join(cmd))
     subprocess.run(cmd, check=True)
-
-
-def connect_duckdb():
-    con = duckdb.connect()
-    con.execute("INSTALL httpfs; LOAD httpfs;")
-    con.execute(f"SET s3_endpoint='{os.environ['AWS_S3_ENDPOINT']}';")
-    con.execute(f"SET s3_region='{os.environ.get('AWS_DEFAULT_REGION', 'us-east-1')}';")
-    con.execute(f"SET s3_access_key_id='{os.environ['AWS_ACCESS_KEY_ID']}';")
-    con.execute(f"SET s3_secret_access_key='{os.environ['AWS_SECRET_ACCESS_KEY']}';")
-    con.execute(f"SET s3_session_token='{os.environ['AWS_SESSION_TOKEN']}';")
-    con.execute("SET s3_url_style='path';")
-    con.execute("SET s3_url_style='path';")
-    con.execute("SET s3_use_ssl=true;")
-    return con
 
 
 def check_s3_exists(s3_uri: str) -> bool:
@@ -446,7 +431,7 @@ def fetch_rnb_dep_to_s3(dep, s3_root):
         con = connect_duckdb()
         con.execute(
             f"""
-            CREATE OR REPLACE TABLE rnb_{dep} AS 
+            CREATE OR REPLACE TABLE rnb_{dep} AS
             SELECT * FROM read_csv_auto('{tmp.name}', delim=';', header=True);
         """
         )
@@ -520,7 +505,7 @@ def fetch_bdnb_dep_to_s3(dep: str, s3_root: str):
     con = connect_duckdb()
     con.execute(
         f"""
-        CREATE OR REPLACE TABLE bdnb_construction_{dep} AS 
+        CREATE OR REPLACE TABLE bdnb_construction_{dep} AS
         SELECT * FROM read_parquet('{local_parquet_1.as_posix()}');
     """
     )
@@ -531,7 +516,7 @@ def fetch_bdnb_dep_to_s3(dep: str, s3_root: str):
 
     con.execute(
         f"""
-        CREATE OR REPLACE TABLE bdnb_groupe_{dep} AS 
+        CREATE OR REPLACE TABLE bdnb_groupe_{dep} AS
         SELECT * FROM read_parquet('{local_parquet_2.as_posix()}');
     """
     )

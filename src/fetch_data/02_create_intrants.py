@@ -18,10 +18,8 @@ import sys
 import json
 from pathlib import Path
 import shutil
-import duckdb
 import pandas as pd
 import geopandas as gpd
-from shapely import wkb
 
 ROOT = Path(__file__).resolve().parents[2]  # /home/onyxia/work/GML typiquement
 
