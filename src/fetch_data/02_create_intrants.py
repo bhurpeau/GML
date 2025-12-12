@@ -28,8 +28,8 @@ ROOT = Path(__file__).resolve().parents[2]  # /home/onyxia/work/GML typiquement
 if str(ROOT / "src") not in sys.path:
     sys.path.append(str(ROOT / "src"))
 
-from utils import TARGET_CRS, perform_semantic_sjoin, parse_rnb_links
-from io import connect_duckdb, read_parquet_s3_as_df, read_parquet_s3_as_gdf
+from utils import perform_semantic_sjoin, parse_rnb_links
+from io_data import connect_duckdb, read_parquet_s3_as_df, read_parquet_s3_as_gdf
 
 # ---------------------------------------------------------------------
 # CONFIG LOCALE
@@ -37,40 +37,7 @@ from io import connect_duckdb, read_parquet_s3_as_df, read_parquet_s3_as_gdf
 DATA_INTRANTS = Path("/home/onyxia/work/GML/data/intrants")
 PLU_PATH = "/home/onyxia/work/GML/data/wfs_du.gpkg"  # à adapter si besoin
 DATA_INTRANTS.mkdir(parents=True, exist_ok=True)
-
-
-def read_parquet_s3_as_df(con: duckdb.DuckDBPyConnection, uri: str) -> pd.DataFrame:
-    """Lecture d'un Parquet sur S3 via DuckDB → pandas.DataFrame."""
-    return con.execute("SELECT * FROM read_parquet(?)", [uri]).df()
-
-
-def read_parquet_s3_as_gdf(
-    con: duckdb.DuckDBPyConnection, uri: str
-) -> gpd.GeoDataFrame:
-    """
-    Lecture d'un Parquet (écrit par GeoPandas) sur S3 via DuckDB,
-    et reconstruction du GeoDataFrame (geometry en WKB).
-    """
-    df = read_parquet_s3_as_df(con, uri)
-
-    # On suppose une colonne 'geometry' en WKB (ce que produit geopandas.to_parquet)
-    if "geometry" not in df.columns:
-        raise ValueError(f"Pas de colonne 'geometry' dans {uri}")
-
-    def to_bytes(val):
-        if isinstance(val, (bytes, bytearray, memoryview)):
-            return bytes(val)
-        return val
-
-    geom_wkb = df["geometry"].apply(to_bytes)
-
-    geom = gpd.GeoSeries.from_wkb(geom_wkb)
-    gdf = gpd.GeoDataFrame(
-        df.drop(columns=["geometry"]),
-        geometry=geom,
-        crs=TARGET_CRS,
-    )
-    return gdf
+TARGET_CRS = "EPSG:2154"
 
 
 def create_intrants_for_dep(dep: str, s3_root: str):

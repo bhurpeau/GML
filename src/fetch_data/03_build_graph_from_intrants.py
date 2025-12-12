@@ -3,14 +3,7 @@
 03_build_graph_from_golden_datasets.py
 
 Construit le graphe hétérogène tripartite (bâtiment / parcelle / adresse)
-à partir des intrants stockés sur S3, et écrit le graphe en local
-(à pousser ensuite sur S3 si besoin).
-
-Usage typique :
-
-uv run python -m src.graph.03_build_graph_from_golden_datasets \
-    --deps 92 75 69 \
-    --s3-intrants-root s3://bhurpeau/WP2/intrants
+à partir des intrants stockés sur S3, et écrit le graphe sur le S3
 """
 
 import argparse
@@ -18,6 +11,7 @@ import json
 import sys
 from pathlib import Path
 import torch
+import shutil
 
 # -----------------------------------------------------------------------------
 # 1. Raccrocher utils.py (build_graph_from_golden_datasets, TARGET_CRS, ...)
@@ -26,11 +20,10 @@ ROOT = Path(__file__).resolve().parents[2]  # /home/onyxia/work/GML typiquement
 if str(ROOT / "src") not in sys.path:
     sys.path.append(str(ROOT / "src"))
 
-from utils import (  # type: ignore  # noqa: E402
-    TARGET_CRS,
-    build_graph_from_golden_datasets,
-)
-from io import connect_duckdb, read_parquet_s3_as_df, read_parquet_s3_as_gdf
+from utils import build_graph_from_golden_datasets
+from io_data import connect_duckdb, read_parquet_s3_as_df, read_parquet_s3_as_gdf
+
+TARGET_CRS = "EPSG:2154"
 
 
 # -----------------------------------------------------------------------------
@@ -71,7 +64,7 @@ def build_graph_for_dep(dep: str, s3_intrants_root: str, out_root: Path):
         gdf_par=gdf_par,
         gdf_ban=gdf_ban,
         df_ban_links=df_ban_links,
-        df_parcelle_links=df_parcelle_links,
+        df_par_links=df_parcelle_links,
     )
 
     # -----------------------------------------------------------------------------
@@ -89,8 +82,9 @@ def build_graph_for_dep(dep: str, s3_intrants_root: str, out_root: Path):
 
     print(f"→ Sauvegarde du bat_map dans {batmap_path}")
     # bat_map : {rnb_id: idx}
+    bat_map_dict = bat_map.to_dict()
     with open(batmap_path, "w", encoding="utf-8") as f:
-        json.dump(bat_map, f, ensure_ascii=False, indent=2)
+        json.dump(bat_map_dict, f, ensure_ascii=False, indent=2)
 
     meta = {
         "dep": dep,
@@ -102,8 +96,27 @@ def build_graph_for_dep(dep: str, s3_intrants_root: str, out_root: Path):
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
+    if "/intrants" in s3_intrants_root:
+        s3_graphs_root = s3_intrants_root.replace("/intrants", "/graphs").replace(
+            "s3://", "s3/"
+        )
+    else:
+        # fallback si jamais tu changes ta convention plus tard
+        s3_graphs_root = s3_intrants_root + "/graphs"
+
+    files_to_push = {
+        "graph.pt": graph_path,
+        "bat_map.json": batmap_path,
+        "meta.json": meta_path,
+    }
+    for fname, local_path in files_to_push.items():
+        s3_uri = f"{s3_graphs_root}/{dep}/{fname}"
+        print(s3_uri)
+        import subprocess
+
+        subprocess.run(["mc", "cp", str(local_path), s3_uri])
     print(f"[OK] Graphe construit et sauvegardé pour {dep} → {out_dir}")
-    print("      (tu peux maintenant le pousser sur S3 avec `mc cp -r` si besoin.)")
+    shutil.rmtree(out_dir, ignore_errors=True)
 
 
 # -----------------------------------------------------------------------------

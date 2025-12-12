@@ -3,6 +3,8 @@ import os
 import pandas as pd
 import geopandas as gpd
 
+TARGET_CRS = "EPSG:2154"
+
 
 def connect_duckdb():
     con = duckdb.connect()

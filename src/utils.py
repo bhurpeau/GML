@@ -6,12 +6,10 @@ import numpy as np
 import pandas as pd
 import geopandas as gpd
 import torch
-import networkx as nx
 import optuna
 
 from sklearn.preprocessing import StandardScaler
 from sklearn.neighbors import NearestNeighbors
-from sklearn.preprocessing import normalize
 
 from torch_geometric.data import HeteroData
 from torch_geometric.nn import knn_graph
@@ -115,22 +113,48 @@ def compute_shape_features(gdf: gpd.GeoDataFrame) -> pd.DataFrame:
     """
     Descripteurs morphologiques standards (2D)
     """
-    geom = gdf.geometry
+    geom = gdf.geometry.make_valid()
     area = geom.area
     perimeter = geom.length
 
     compactness = (4 * np.pi * area) / (perimeter**2 + 1e-6)
     convexity = area / (geom.convex_hull.area + 1e-6)
 
-    def elong(poly):
-        if poly.is_empty:
+    def elong(geom):
+        # Géométrie vide / manquante
+        if geom is None or geom.is_empty:
             return 0.0
-        rect = poly.minimum_rotated_rectangle
-        coords = np.array(rect.exterior.coords)
+
+        # Si MultiPolygon, on prend le plus grand polygone
+        if geom.geom_type == "MultiPolygon":
+            try:
+                geom = max(geom.geoms, key=lambda g: g.area)
+            except ValueError:
+                return 0.0
+
+        # On ne calcule l’élongation que pour des polygones
+        if geom.geom_type != "Polygon":
+            return 0.0
+
+        rect = geom.minimum_rotated_rectangle
+
+        # Pour des polygones dégénérés, shapely peut renvoyer Point/LineString
+        if rect.geom_type != "Polygon" or not hasattr(rect, "exterior"):
+            return 0.0
+
+        coords = np.asarray(rect.exterior.coords)
+        if coords.shape[0] < 4:
+            return 0.0
+
         d1 = np.linalg.norm(coords[1] - coords[0])
         d2 = np.linalg.norm(coords[2] - coords[1])
+
         w, l = sorted([d1, d2])
-        return 1.0 - w / (l + 1e-6)
+        if l < 1e-6:
+            return 0.0
+
+        # 0 = carré / rond-ish ; 1 = très allongé
+        return 1.0 - (w / (l + 1e-6))
 
     elongation = geom.apply(elong)
     fractality = (2 * np.log(perimeter + 1e-6)) / (np.log(area + 1e-6))
@@ -276,6 +300,7 @@ def prepare_node_features(
 def project_building_adjacency_sparse(
     num_bat, num_par, edge_index_bp, edge_index_pp, weights_pp
 ):
+
     M_bp = SparseTensor(
         row=edge_index_bp[0],
         col=edge_index_bp[1],
@@ -306,37 +331,70 @@ def build_graph_from_golden_datasets(
     gdf_bat, gdf_par, gdf_ban, df_ban_links, df_par_links
 ):
     bat_x, par_x, ban_x = prepare_node_features(gdf_bat, gdf_par, gdf_ban)
+    bat_index = (
+        gdf_bat[["rnb_id"]]
+        .drop_duplicates()
+        .reset_index(drop=True)
+        .reset_index()
+        .rename(columns={"index": "b"})
+    )
 
-    bat_map = {k: i for i, k in enumerate(gdf_bat["rnb_id"])}
-    par_map = {k: i for i, k in enumerate(gdf_par["parcelle_id"])}
-    ban_map = {k: i for i, k in enumerate(gdf_ban["ban_id"])}
+    bat_map = pd.Series(bat_index["b"].values, index=bat_index["rnb_id"])
+    par_map = pd.Series(np.arange(len(gdf_par)), index=gdf_par.index)
+    ban_map = pd.Series(np.arange(len(gdf_ban)), index=gdf_ban["ban_id"])
 
     # Bâtiment–Parcelle
     bp = df_par_links.copy()
-    bp["b"] = bp["rnb_id"].map(bat_map)
-    bp["p"] = bp["parcelle_id"].map(par_map)
-    bp = bp.dropna()
 
-    edge_bp = torch.tensor(bp[["b", "p"]].values.T, dtype=torch.long)
-    edge_bp_attr = torch.tensor(bp["cover_ratio"].values).unsqueeze(1)
+    # Jointure bâtiment → index b
+    bp = bp.merge(bat_index, on="rnb_id", how="inner")
+
+    # Jointure parcelle → index p (basé sur l’index gdf_par)
+    par_index = gdf_par.reset_index()[["index", "parcelle_id"]].rename(
+        columns={"index": "p"}
+    )
+
+    bp = bp.merge(par_index, on="parcelle_id", how="inner")
+
+    # Sécurité
+    bp = bp.dropna(subset=["b", "p"])
+
+    bp["b"] = bp["b"].astype(np.int64)
+    bp["p"] = bp["p"].astype(np.int64)
+
+    edge_bp = torch.from_numpy(bp[["b", "p"]].to_numpy().T).long()
+    edge_bp_attr = torch.from_numpy(
+        bp["cover_ratio"].to_numpy(dtype=np.float32)
+    ).unsqueeze(1)
 
     # Parcelle–Parcelle
-    sjoin = gpd.sjoin(gdf_par, gdf_par, predicate="touches")
-    sjoin = sjoin[sjoin.index_left != sjoin.index_right]
+    sjoin = gpd.sjoin(gdf_par, gdf_par, predicate="touches", how="inner")
 
-    src = sjoin.index_left.map(par_map).values
-    dst = sjoin.index_right.map(par_map).values
+    sjoin = sjoin[sjoin.index != sjoin["index_right"]]
+    par_map_index = pd.Series(np.arange(len(gdf_par)), index=gdf_par.index)
 
-    weights = []
-    for i, j in zip(sjoin.index_left, sjoin.index_right):
-        weights.append(
-            gdf_par.geometry.iloc[i].intersection(gdf_par.geometry.iloc[j]).length
-        )
+    src = par_map_index.loc[sjoin.index].to_numpy(dtype=np.int64)
+    dst = par_map_index.loc[sjoin["index_right"]].to_numpy(dtype=np.int64)
 
-    edge_pp = torch.tensor([src, dst])
-    weights_pp = torch.tensor(weights)
+    edge_pp = torch.from_numpy(np.vstack([src, dst])).long()
 
+    # poids = longueur de frontière partagée
+    geom_left = gdf_par.geometry.loc[sjoin.index].to_numpy()
+    geom_right = gdf_par.geometry.loc[sjoin["index_right"]].to_numpy()
+    weights = np.fromiter(
+        (a.intersection(b).length for a, b in zip(geom_left, geom_right)),
+        dtype=float,
+        count=len(sjoin),
+    )
+
+    weights_pp = torch.from_numpy(weights).float()
+
+    # symétrisation
     edge_pp, weights_pp = pyg_utils.to_undirected(edge_pp, weights_pp)
+    assert edge_bp.dtype == torch.long
+    assert edge_bp.min() >= 0
+    assert edge_bp[0].max() < len(bat_map)
+    assert edge_bp[1].max() < len(par_map)
 
     edge_bb, weights_bb = project_building_adjacency_sparse(
         len(bat_map), len(par_map), edge_bp, edge_pp, weights_pp
