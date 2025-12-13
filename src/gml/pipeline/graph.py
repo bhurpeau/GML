@@ -10,7 +10,11 @@ from pathlib import Path
 import torch
 import shutil
 from gml.graph.build import build_graph_from_golden_datasets
-from gml.io.duckdb_s3 import connect_duckdb, read_parquet_s3_as_df, read_parquet_s3_as_gdf
+from gml.io.duckdb_s3 import (
+    connect_duckdb,
+    read_parquet_s3_as_df,
+    read_parquet_s3_as_gdf,
+)
 from gml.io.paths import DATA_GRAPHS
 from gml.config import TARGET_CRS
 
@@ -105,7 +109,7 @@ def build_graph_for_dep(dep: str, s3_intrants_root: str, out_root: Path):
         print(s3_uri)
         import subprocess
 
-        subprocess.run(["mc", "cp", str(local_path), s3_uri])
+        subprocess.run(["mc", "cp", str(local_path), s3_uri], check=True)
     print(f"[OK] Graphe construit et sauvegardé pour {dep} → {out_dir}")
     shutil.rmtree(out_dir, ignore_errors=True)
 

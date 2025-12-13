@@ -13,20 +13,19 @@ Pour chaque département, on produit en LOCAL :
     data/intrants/<dep>/parcelle_links.parquet
 """
 
-import sys
 import json
 from pathlib import Path
-import shutil
 import pandas as pd
 import geopandas as gpd
-
-from utils import perform_semantic_sjoin, parse_rnb_links
+import shutil
+from gml.data.intrants import parse_rnb_links, perform_semantic_sjoin
 from gml.io.duckdb_s3 import (
     connect_duckdb,
     read_parquet_s3_as_df,
     read_parquet_s3_as_gdf,
 )
 from gml.io.paths import DATA_INTRANTS
+from gml.config import TARGET_CRS
 
 # ---------------------------------------------------------------------
 # CONFIG LOCALE

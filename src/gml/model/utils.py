@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 #!/usr/bin/env python
-import torch
 
-XY_KEY = ("adresse", "accès", "bâtiment")
+
+XY_KEY = ("adresse", "localise", "bâtiment")
 YZ_KEY = ("bâtiment", "appartient", "parcelle")
 
 

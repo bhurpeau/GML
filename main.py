@@ -12,19 +12,19 @@ import numpy as np
 # === Modules prétraitements ===
 from src.utils import (
     create_golden_datasets,
-    build_graph_from_golden_datasets,
-    load_best_params_from_optuna,
+    build_graph_from_golden_datasets
 )
-from src.hetero import HeteroGNN
+from gml.train.utils import load_best_params_from_optuna
+from gml.model.hetero import HeteroGNN
 
 # === Modules DMoN-3p fournis (voir messages précédents) ===
-from src.dmon3p import DMoN3P
-from src.heads import TripletHeads
-from src.utils_tripartite import (
+from gml.model.dmon3p import DMoN3P
+from gml.model.heads import TripletHeads
+from gml.model.utils import (
     XY_KEY,
     YZ_KEY,
-)  # ('adresse','accès','bâtiment'), ('bâtiment','appartient','parcelle')
-from src.train_tripartite import train_dmon3p
+)
+from gml.train.train_tripartite import train_dmon3p
 
 
 def parse_args():

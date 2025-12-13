@@ -34,6 +34,7 @@ from tqdm import tqdm
 from gml.io.duckdb_s3 import connect_duckdb
 from gml.io.paths import DATA_RAW
 from gml.config import TARGET_CRS
+
 # ---------------------------------------------------------------------
 # CONFIG GLOBALE
 # ---------------------------------------------------------------------
