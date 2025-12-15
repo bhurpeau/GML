@@ -8,4 +8,4 @@ out/
 # Virtual environments
 .venv
 *.ipynb
-
+*.egg-info

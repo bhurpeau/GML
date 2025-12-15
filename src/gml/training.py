@@ -10,7 +10,7 @@ import pandas as pd
 import numpy as np
 from torch.utils.data import DataLoader
 # === Modules prétraitements ===
-from gml.train.utils import load_best_params_from_optuna, maybe_pick_scalar_weight
+from gml.train.utils import load_best_params_from_optuna
 from gml.model.hetero import HeteroGNN
 
 # === Modules DMoN-3p fournis (voir messages précédents) ===
@@ -20,7 +20,7 @@ from gml.model.utils import (
     XY_KEY,
     YZ_KEY,
 )
-from gml.train.train_tripartite import train_dmon3p
+from gml.train.train_tripartite import train_dmon3p_multidep
 from gml.train.dataset import DeptGraphDataset
 
 
@@ -78,6 +78,7 @@ def parse_args():
     return p.parse_args()
 
 
+
 def main():
     args = parse_args()
     device = args.device
@@ -102,46 +103,42 @@ def main():
     if "prune_every" in best_params:
         args.epochs_prune = int(best_params["prune_every"])
 
+    def make_criterion(data):
+        X = data["adresse"].x.size(0)
+        Y = data["bâtiment"].x.size(0)
+        Z = data["parcelle"].x.size(0)
+        return DMoN3P(
+            num_X=X, num_Y=Y, num_Z=Z,
+            L=args.L, M=args.M, N=args.N,
+            beta=args.beta, gamma=args.gamma,   # sera écrasé par schedule_beta[0] dans train_dmon3p
+            entropy_weight=args.entropy_weight,
+            lambda_X=args.lambda_collapse,
+            lambda_Y=args.lambda_collapse,
+            lambda_Z=args.lambda_collapse,
+            m_chunk=args.m_chunk,
+        )
+
     print("=== Chargement des données ===")
     dataset = DeptGraphDataset(args.deps, args.s3_root)
     loader = DataLoader(dataset, batch_size=1, shuffle=True)
 
+    data0 = dataset[0] 
     for nt in ("adresse", "bâtiment", "parcelle"):
-        if nt not in data.node_types:
-            raise KeyError(f"Type de nœud manquant : {nt}. Trouvés : {data.node_types}")
+        if nt not in data0.node_types:
+            raise KeyError(f"Type de nœud manquant : {nt}. Trouvés : {data0.node_types}")
 
-    node_feature_sizes = {nt: data[nt].x.size(1) for nt in data.node_types}
-    X = data["adresse"].x.size(0)
-    Y = data["bâtiment"].x.size(0)
-    Z = data["parcelle"].x.size(0)
-    metadata = data.metadata()
-
-    print("=== Initialisation du modèle ===")
+    metadata = data0.metadata()
+    node_feature_sizes = {nt: data0[nt].x.size(1) for nt in data0.node_types}   
     model = HeteroGNN(
         hidden_channels=args.hidden,
         out_channels=args.emb_dim,
         num_layers=2,
         metadata=metadata,
         node_feature_sizes=node_feature_sizes,
-        edge_feature_size=2, #à regarder
+        edge_feature_size=2,  # tu peux laisser pour l’instant
     ).to(device)
 
     heads = TripletHeads(dim=args.emb_dim, L=args.L, M=args.M, N=args.N).to(device)
-    criterion = DMoN3P(
-        num_X=X,
-        num_Y=Y,
-        num_Z=Z,
-        L=args.L,
-        M=args.M,
-        N=args.N,
-        beta=args.beta,
-        gamma=args.gamma,
-        entropy_weight=args.entropy_weight,
-        lambda_X=args.lambda_collapse,
-        lambda_Y=args.lambda_collapse,
-        lambda_Z=args.lambda_collapse,
-        m_chunk=args.m_chunk,
-    ).to(device)
 
     optimizer = torch.optim.Adam(
         list(model.parameters()) + list(heads.parameters()),
@@ -149,28 +146,14 @@ def main():
         weight_decay=args.weight_decay,
     )
 
-    # Préparer les relations pour la perte
-    edge_index_XY = data[XY_KEY].edge_index.to(device)
-    edge_index_YZ = data[YZ_KEY].edge_index.to(device)
-    w_XY = maybe_pick_scalar_weight(getattr(data[XY_KEY], "edge_attr", None))
-    w_YZ = maybe_pick_scalar_weight(getattr(data[YZ_KEY], "edge_attr", None))
-    if w_XY is not None:
-        w_XY = w_XY.to(device)
-    if w_YZ is not None:
-        w_YZ = w_YZ.to(device)
-
-    # === Entraînement complet via train_loop ===
-    print("=== Entraînement DMoN-3p (avec pruning, annealing) ===")
-    train_dmon3p(
-        model,
-        heads,
-        criterion,
-        optimizer,
-        data,
-        edge_index_XY,
-        edge_index_YZ,
-        w_XY=w_XY,
-        w_YZ=w_YZ,
+    train_dmon3p_multidep(
+        model=model,
+        heads=heads,
+        optimizer=optimizer,
+        loader=loader,
+        make_criterion_fn=make_criterion,
+        XY_KEY=XY_KEY,
+        YZ_KEY=YZ_KEY,
         epochs=args.epochs,
         device=device,
         lam_g=1e-3,
@@ -178,9 +161,7 @@ def main():
         schedule_beta=(2.0, args.beta, args.anneal_step),
         schedule_gamma=(1.0, args.gamma, args.anneal_step),
         prune_every=args.epochs_prune,
-        prune_delay_epoch=(
-            args.prune_delay_epoch or 80 if args.prune_delay_epoch is not None else 80
-        ),
+        prune_delay_epoch=(args.prune_delay_epoch if args.prune_delay_epoch is not None else 80),
         min_usage=2e-3,
         min_gate=0.10,
         m_chunk=args.m_chunk,
@@ -307,3 +288,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+

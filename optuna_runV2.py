@@ -8,12 +8,16 @@ import optuna
 import traceback
 
 # Assure-toi que les imports sont bons selon ton arborescence
-from src.train_tripartite import train_dmon3p
-from src.dmon3p import DMoN3P
-from src.heads import TripletHeads
-from src.hetero import HeteroGNN
-from src.utils import create_golden_datasets, build_graph_from_golden_datasets
-from src.utils_tripartite import XY_KEY, YZ_KEY
+from gml.train.train_tripartite import train_dmon3p
+from gml.model.dmon3p import DMoN3P
+from gml.model.heads import TripletHeads
+from gml.model.hetero import HeteroGNN
+from gml.model.utils import XY_KEY, YZ_KEY
+
+def load_graph(dep: str, graphs_root: str, device: str):
+    path = os.path.join(graphs_root, dep.zfill(2), "graph.pt")
+    data = torch.load(path, map_location=device)
+    return data
 
 
 def maybe_pick_scalar_weight(edge_attr):

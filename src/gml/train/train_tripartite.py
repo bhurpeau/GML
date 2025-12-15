@@ -3,82 +3,12 @@
 
 import torch
 from typing import Optional
-
-# -------------------------------------------------------------------
-# Pruning: compresse physiquement les sorties (lignes) des têtes et
-# ajuste les dimensions L/M/N dans le critère.
-# -------------------------------------------------------------------
-
-
-def prune_columns(
-    heads,
-    criterion,
-    usage,
-    gates,
-    min_usage: float = 2e-3,
-    min_gate: float = 0.10,
-    which: str = "Y",
-):
-    """
-    usage: dict {'X': uX, 'Y': uY, 'Z': uZ} usages moyens par colonne (1D)
-    gates: dict {'X': gX, 'Y': gY, 'Z': gZ} valeurs actuelles des portes (1D)
-    which: 'X'|'Y'|'Z'|'all' : quel type pruner
-    Retourne: dict de masques booléens
-    """
-    masks = {}
-
-    for key, KMN, head_layer, logit_g in [
-        ("X", criterion.L, heads.head_X, heads.logit_gX),
-        ("Y", criterion.M, heads.head_Y, heads.logit_gY),
-        ("Z", criterion.N, heads.head_Z, heads.logit_gZ),
-    ]:
-        if which != "all" and which != key:
-            masks[key] = torch.ones(KMN, dtype=torch.bool, device=logit_g.device)
-            continue
-
-        u = usage[key]  # [K]
-        g = gates[key]  # [K]
-        mask = (u > min_usage) & (g > min_gate)
-
-        # Toujours en garder au moins 2
-        if mask.sum() < 2:
-            top2 = torch.topk(u, k=min(2, u.numel())).indices
-            mask[top2] = True
-
-        masks[key] = mask
-
-        # Compression des sorties = LIGNES du poids
-        if mask.sum() < KMN:
-            with torch.no_grad():
-                W = head_layer.weight.data[mask, :]  # (kept_out, in_features)
-                head_layer.weight = torch.nn.Parameter(W)
-                if head_layer.bias is not None:
-                    b = head_layer.bias.data[mask]  # (kept_out,)
-                    head_layer.bias = torch.nn.Parameter(b)
-
-                # Gates correspondantes
-                new_logit = logit_g.data[mask]
-                if key == "X":
-                    heads.logit_gX = torch.nn.Parameter(new_logit)
-                elif key == "Y":
-                    heads.logit_gY = torch.nn.Parameter(new_logit)
-                else:
-                    heads.logit_gZ = torch.nn.Parameter(new_logit)
-
-            # Mise à jour des dimensions dans le critère
-            if key == "X":
-                criterion.L = int(mask.sum())
-            elif key == "Y":
-                criterion.M = int(mask.sum())
-            else:
-                criterion.N = int(mask.sum())
-
-    return masks
-
-
+from gml.train.utils import maybe_pick_scalar_weight
 # -------------------------------------------------------------------
 # Entraînement DMoN-3p avec annealing, pruning différé et Optuna (optionnel)
 # -------------------------------------------------------------------
+
+
 def train_dmon3p(
     model,
     heads,
@@ -250,3 +180,78 @@ def train_dmon3p(
         Sy = torch.softmax(Sy_logits, dim=1).cpu()
 
     return {"Q_final": best_Q, "Sy": Sy}
+
+
+def train_dmon3p_multidep(
+    model,
+    heads,
+    optimizer,
+    loader,
+    make_criterion_fn,   # callable(data)->criterion (DMoN3P)
+    XY_KEY,
+    YZ_KEY,
+    epochs: int,
+    device: str = "cuda",
+    lam_g: float = 1e-3,
+    clip_grad: float = 1.0,
+    schedule_beta=(2.0, 8.0, 10),
+    schedule_gamma=(1.0, 2.0, 10),
+    anneal_delay_epoch: int = 0,
+    prune_every: int = 10,
+    min_usage: float = 2e-3,
+    min_gate: float = 0.10,
+    prune_delay_epoch: int = 100,
+    m_chunk: int = 256,
+    use_amp: bool = True,
+    trial=None,
+):
+    b0, bmax, bstep = schedule_beta
+    g0, gmax, gstep = schedule_gamma
+
+    for e in range(1, epochs + 1):
+        # beta/gamma globaux à l'époque e
+        beta_t = scheduled_value(b0, bmax, bstep, e, epochs, delay=anneal_delay_epoch)
+        gamma_t = scheduled_value(g0, gmax, gstep, e, epochs, delay=anneal_delay_epoch)
+
+        for batch in loader:
+            data = batch[0] if isinstance(batch, (list, tuple)) else batch
+
+            # edges pour la loss
+            edge_index_XY = data[XY_KEY].edge_index
+            edge_index_YZ = data[YZ_KEY].edge_index
+
+            w_XY = maybe_pick_scalar_weight(getattr(data[XY_KEY], "edge_attr", None))
+            w_YZ = maybe_pick_scalar_weight(getattr(data[YZ_KEY], "edge_attr", None))
+            if w_XY is not None: w_XY = w_XY.to(device)
+            if w_YZ is not None: w_YZ = w_YZ.to(device)
+
+            # criterion dépend des tailles
+            criterion = make_criterion_fn(data).to(device)
+
+            # On appelle ton train_dmon3p sur 1 epoch seulement
+            train_dmon3p(
+                model=model,
+                heads=heads,
+                criterion=criterion,
+                optimizer=optimizer,
+                data=data,
+                edge_index_XY=edge_index_XY,
+                edge_index_YZ=edge_index_YZ,
+                w_XY=w_XY,
+                w_YZ=w_YZ,
+                epochs=1,
+                device=device,
+                lam_g=lam_g,
+                clip_grad=clip_grad,
+                schedule_beta=(beta_t, beta_t, bstep),   # figé à beta_t
+                schedule_gamma=(gamma_t, gamma_t, gstep),# figé à gamma_t
+                anneal_delay_epoch=anneal_delay_epoch,
+                prune_every=prune_every,
+                min_usage=min_usage,
+                min_gate=min_gate,
+                prune_delay_epoch=prune_delay_epoch,
+                m_chunk=m_chunk,
+                use_amp=use_amp,
+                trial=trial,
+            )
+
