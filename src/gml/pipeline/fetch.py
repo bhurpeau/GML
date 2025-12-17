@@ -1,47 +1,54 @@
-#!/usr/bin/env python
-# 01_fetch_data.py
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
 """
-Récupère les données issues des sources BDTOPO, Cadastre, RNB, BDNB et BAN.
+GML - Fetch pipeline
 
-Pour chaque département, on dépose sur s3 :
+Télécharge et pousse sur S3 (MinIO) :
+- BAN
+- Cadastre
+- RNB
+- BDTOPO
+- BDNB
 
-    {s3_root}/RNB/{dep}/RNB_{dep}.parquet
-    {s3_root}/BDTOPO/{dep}/bdtopo-{dep}.parquet
-    {s3_root}/BDNB/{dep}/bdnb-construction-{dep}.parquet
-    {s3_root}/BDNB/{dep}/bdnb-groupe-{dep}.parquet
-    {s3_root}/CADASTRE/{dep}/cadastre-{dep}-parcelles.parquet
-    {s3_root}/BAN/{dep}/adresses-{dep}.parquet
 """
 
-import boto3
-from botocore.exceptions import ClientError
-from urllib.parse import urlparse
 import argparse
+import os
+import random
+import re
+import shutil
+import subprocess
+import time
 import zipfile
 import io
 import gzip
 import tempfile
 import geopandas as gpd
-import requests
-import os
-import re
-import shutil
-import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from bs4 import BeautifulSoup
-from tqdm import tqdm
-from gml.io.duckdb_s3 import connect_duckdb
+from threading import Semaphore
+from typing import Optional
 from gml.io.paths import DATA_RAW
-from gml.config import TARGET_CRS
+from gml.config import TARGET_CRS, DEP_FRANCE, DEFAULT_WORKERS
+from gml.io.duckdb_s3 import connect_duckdb
+import requests
+from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-# ---------------------------------------------------------------------
-# CONFIG GLOBALE
-# ---------------------------------------------------------------------
 
+# -----------------------------------------------------------------------------
+# Config
+# -----------------------------------------------------------------------------
 
-BDTOPO_PAGE = "https://geoservices.ign.fr/bdtopo"
-BDTOPO_DATE_FILTER = "2025-09"
+BDTOPO_SEM = Semaphore(int(os.environ.get("GML_BDTOPO_CONCURRENCY", "3")))
+
+# Retry/backoff pour DNS / resets / 5xx
+_HTTP_SESSION: Optional[requests.Session] = None
+
+BDTOPO_DOWNLOAD_PAGE = "https://geoservices.ign.fr/bdtopo"
+BDTOPO_DATE_FILTER = os.environ.get("GML_BDTOPO_DATE_FILTER", "2025-09-15")
 BAN_BASE = "https://adresse.data.gouv.fr/data/ban/adresses/2025-06-25/csv"
 CADASTRE_BASE = (
     "https://cadastre.data.gouv.fr/data/etalab-cadastre/2025-09-01/geojson/departements"
@@ -49,65 +56,317 @@ CADASTRE_BASE = (
 BDTOPO_DOWNLOAD_DIR = DATA_RAW / "BDTOPO" / "downloads"
 BDTOPO_UNZIP_DIR = DATA_RAW / "BDTOPO" / "unzipped"
 
-
-# ---------------------------------------------------------------------
-# OUTILS
-# ---------------------------------------------------------------------
-def run(cmd):
-    print(">>", " ".join(cmd))
-    subprocess.run(cmd, check=True)
+# -----------------------------------------------------------------------------
+# Utils
+# -----------------------------------------------------------------------------
 
 
-def check_s3_exists(s3_uri: str) -> bool:
-    """Vérifie si un fichier existe sur S3 sans le télécharger (HEAD request)."""
-    parsed = urlparse(s3_uri)
-    bucket = parsed.netloc
-    key = parsed.path.lstrip("/")
+def run(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, check=check)
 
-    s3 = boto3.client(
-        "s3",
-        endpoint_url="https://" + os.environ.get("AWS_S3_ENDPOINT"),
-        aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
-        aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
-        aws_session_token=os.environ.get("AWS_SESSION_TOKEN"),
-        region_name=os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
+
+def s3_path(root: str, *parts: str) -> str:
+    root = root.rstrip("/")
+    return "/".join([root, *parts])
+
+
+def mc_cp_to_s3(local_path: Path, s3_uri: str) -> None:
+    # attend un s3_uri du style "s3/<bucket>/.../file"
+    run(["mc", "cp", str(local_path), s3_uri])
+
+
+def mc_cp_from_s3(s3_uri: str, local_path: Path) -> None:
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    run(["mc", "cp", s3_uri, str(local_path)])
+
+
+def mc_exists(s3_uri: str) -> bool:
+    # "mc stat" renvoie code != 0 si absent
+    p = subprocess.run(
+        ["mc", "stat", s3_uri], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
-
-    try:
-        s3.head_object(Bucket=bucket, Key=key)
-        return True
-    except ClientError:
-        return False
+    return p.returncode == 0
 
 
-def stream_download(url: str, out_path: Path):
+def get_session() -> requests.Session:
+    global _HTTP_SESSION
+    if _HTTP_SESSION is None:
+        retry = Retry(
+            total=8,
+            connect=8,
+            read=8,
+            status=8,
+            backoff_factor=0.8,  # exponentiel
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=("GET", "HEAD"),
+            raise_on_status=False,
+        )
+        s = requests.Session()
+        s.headers.update({"User-Agent": "gml-fetch/1.0"})
+        s.mount(
+            "https://",
+            HTTPAdapter(max_retries=retry, pool_connections=16, pool_maxsize=16),
+        )
+        _HTTP_SESSION = s
+    return _HTTP_SESSION
+
+
+def stream_download(url: str, out_path: Path, *, max_attempts: int = 8) -> Path:
+    """
+    Download robuste : retries + backoff + timeout.
+    Gère mieux les erreurs intermittentes (dont DNS).
+    """
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    if out_path.exists():
-        print(f"[SKIP] {out_path.name} existe déjà")
+    if out_path.exists() and out_path.stat().st_size > 0:
+        print(
+            f"[SKIP] {out_path.name} existe déjà ({out_path.stat().st_size/1e6:.1f} MB)"
+        )
         return out_path
 
-    print(f"[DL] {url} -> {out_path}")
-    with requests.get(url, stream=True) as r:
-        r.raise_for_status()
-        total = int(r.headers.get("content-length", 0))
-        with (
-            open(out_path, "wb") as f,
-            tqdm(total=total, unit="B", unit_scale=True, desc=out_path.name) as pbar,
-        ):
-            for chunk in r.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
-                    pbar.update(len(chunk))
-    return out_path
+    session = get_session()
+    last = None
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            print(f"[DL] ({attempt}/{max_attempts}) {url} -> {out_path}")
+            with session.get(url, stream=True, timeout=(10, 180)) as r:
+                r.raise_for_status()
+                tmp = out_path.with_suffix(out_path.suffix + ".part")
+                with open(tmp, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            f.write(chunk)
+                os.replace(tmp, out_path)
+                return out_path
+
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            last = e
+            sleep = min(60.0, (2**attempt) * 0.5) + random.random()
+            print(f"[WARN] download failed: {e} — retry in {sleep:.1f}s")
+            time.sleep(sleep)
+            continue
+
+    raise last
 
 
-# ---------------------------------------------------------------------
-# BDTOPO
-# ---------------------------------------------------------------------
-def find_bdtopo_7z_links(date):
-    resp = requests.get(BDTOPO_PAGE)
+def safe_rmtree(path: Path) -> None:
+    try:
+        shutil.rmtree(path, ignore_errors=True)
+    except Exception:
+        pass
+
+
+# -----------------------------------------------------------------------------
+# BAN
+# -----------------------------------------------------------------------------
+
+
+def fetch_ban_dep_to_s3(dep: str, s3_root: str) -> None:
+    dep = dep.zfill(2)
+    url = f"{BAN_BASE}/adresses-{dep}.csv.gz"
+    s3_uri = f"{s3_root}/BAN/{dep}/adresses-{dep}.parquet"
+    if mc_exists(s3_uri):
+        print(f"[SKIP] BAN {dep} existe déjà sur S3 ({s3_uri})")
+        return
+    con = connect_duckdb()
+    con.execute(
+        f"""
+        CREATE OR REPLACE TABLE ban_{dep} AS
+        SELECT * FROM read_csv_auto(
+            '{url}',
+            delim=';',
+            header=True,
+            ignore_errors = True
+        );
+    """
+    )
+    con.execute(f"COPY ban_{dep} TO '{s3_uri}' (FORMAT PARQUET);")
+    print(f"[OK] BAN {dep} -> {s3_uri}")
+
+
+# -----------------------------------------------------------------------------
+# Cadastre
+# -----------------------------------------------------------------------------
+
+
+def fetch_cadastre_dep_to_s3(dep: str, s3_root: str) -> None:
+    dep = dep.zfill(2)
+    s3_uri = f"{s3_root}/CADASTRE/{dep}/cadastre-{dep}-parcelles.parquet"
+    url = f"{CADASTRE_BASE}/{dep}/cadastre-{dep}-parcelles.json.gz"
+    if mc_exists(s3_uri):
+        print(f"[SKIP] BAN {dep} existe déjà sur S3 ({s3_uri})")
+        return
+    print(f"[INFO] Téléchargement Cadastre {dep}")
+    base_dir = DATA_RAW / "CADASTRE" / dep
+    base_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Télécharger le .json.gz
+    gz_path = base_dir / f"cadastre-{dep}-parcelles.json.gz"
+    json_path = base_dir / f"cadastre-{dep}-parcelles.json"
+    parquet_path = base_dir / f"cadastre-{dep}-parcelles.parquet"
+
+    # stream_download est ta fonction existante
+    stream_download(url, gz_path)
+
+    # 2. Décompression .gz → .geojson
+    print(" → Décompression du GeoJSON.gz")
+    with gzip.open(gz_path, "rb") as f_in, open(json_path, "wb") as f_out:
+        shutil.copyfileobj(f_in, f_out)
+
+    # 3. Lecture avec GeoPandas
+    print(" → Lecture du GeoJSON avec GeoPandas")
+    gdf = gpd.read_file(json_path)
+    gdf = gdf.to_crs("EPSG:2154")  # ou TARGET_CRS si tu préfères centraliser
+
+    # 4. Écriture GeoParquet local
+    print(" → Écriture GeoParquet local")
+    gdf.to_parquet(parquet_path)
+
+    # 5. Envoi vers S3 via DuckDB
+    con = connect_duckdb()
+
+    con.execute(
+        f"""
+        CREATE OR REPLACE TABLE cadastre_{dep} AS
+        SELECT * FROM read_parquet('{parquet_path.as_posix()}');
+    """
+    )
+    con.execute(f"COPY cadastre_{dep} TO '{s3_uri}' (FORMAT PARQUET);")
+    print(f"[OK] Cadastre {dep} → {s3_uri}")
+    safe_rmtree(base_dir)
+
+
+# -----------------------------------------------------------------------------
+# RNB
+# -----------------------------------------------------------------------------
+
+
+def fetch_rnb_dep_to_s3(dep: str, s3_root: str) -> None:
+    dep = dep.zfill(2)
+    url = f"https://rnb-opendata.s3.fr-par.scw.cloud/files/RNB_{dep}.csv.zip"
+    s3_uri = f"{s3_root}/RNB/{dep}/RNB_{dep}.parquet"
+    if mc_exists(s3_uri):
+        print(f"[SKIP] RNB {dep} existe déjà sur S3 ({s3_uri})")
+        return
+    # Télécharger et dézipper en mémoire
+    resp = requests.get(url)
     resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
+    z = zipfile.ZipFile(io.BytesIO(resp.content))
+    csv_name = z.namelist()[0]
+    csv_bytes = z.read(csv_name)
+
+    # On le recomprime en gzip dans un tempfile
+    with tempfile.NamedTemporaryFile(suffix=".csv.gz", delete=True) as tmp:
+        with gzip.open(tmp.name, "wb") as gz:
+            gz.write(csv_bytes)
+
+        con = connect_duckdb()
+        con.execute(
+            f"""
+            CREATE OR REPLACE TABLE rnb_{dep} AS
+            SELECT * FROM read_csv_auto('{tmp.name}', delim=';', header=True);
+        """
+        )
+
+        con.execute(f"COPY rnb_{dep} TO '{s3_uri}' (FORMAT PARQUET);")
+
+    print(f"[OK] RNB {dep} -> {s3_uri}")
+
+
+# -----------------------------------------------------------------------------
+# BDNB
+# -----------------------------------------------------------------------------
+
+
+def fetch_bdnb_dep_to_s3(dep: str, s3_root: str) -> None:
+    dep = dep.zfill(2)
+    url = f"https://open-data.s3.fr-par.scw.cloud/bdnb_millesime_2025-07-a/millesime_2025-07-a_dep{dep}/open_data_millesime_2025-07-a_dep{dep}_gpkg.zip"
+    s3_uri_construction = f"{s3_root}/BDNB/{dep}/bdnb-construction-{dep}.parquet"
+    s3_uri_groupe = f"{s3_root}/BDNB/{dep}/bdnb-groupe-{dep}.parquet"
+    if mc_exists(s3_uri_construction) and mc_exists(s3_uri_groupe):
+        print(f"[SKIP] BDNB {dep} existe déjà sur S3 ({s3_uri_construction})")
+        return
+    dl_dir = DATA_RAW / "BDNB" / "downloads" / dep
+    unzip_dir = DATA_RAW / "BDNB" / "unzipped" / dep
+    out_dir = DATA_RAW / "BDNB" / dep
+    for d in [dl_dir, unzip_dir, out_dir]:
+        d.mkdir(parents=True, exist_ok=True)
+
+    fname = url.split("/")[-1]
+    local_zip = dl_dir / fname
+    stream_download(url, local_zip)
+
+    # Unzip local
+    with zipfile.ZipFile(local_zip, "r") as z:
+        z.extractall(unzip_dir)
+
+    # Chercher le .gpkg
+    gpkg_files = []
+    for dirpath, dirnames, filenames in os.walk(unzip_dir):
+        for fn in filenames:
+            if fn.endswith(".gpkg") and "bdnb" in fn:
+                gpkg_files.append(os.path.join(dirpath, fn))
+
+    if not gpkg_files:
+        raise RuntimeError(f"Aucun fichier GPKG trouvé dans BDNB {dep}")
+    if len(gpkg_files) > 1:
+        print(
+            f"[WARN] Plusieurs fichiers GPKG trouvés pour BDNB {dep}, on prend le premier."
+        )
+
+    gpkg_path = gpkg_files[0]
+
+    # Lecture GeoPandas
+    gdf_construction = gpd.read_file(gpkg_path, layer="batiment_construction")[
+        ["batiment_construction_id", "batiment_groupe_id"]
+    ]
+    gdf_groupe_compile = gpd.read_file(gpkg_path, layer="batiment_groupe_compile")
+
+    # Écrire temporairement en parquet local
+    local_parquet_1 = out_dir / f"bdnb-construction-{dep}.parquet"
+    gdf_construction.to_parquet(local_parquet_1)
+    local_parquet_2 = out_dir / f"bdnb-groupe-{dep}.parquet"
+    gdf_groupe_compile.to_parquet(local_parquet_2)
+
+    # Envoyer vers S3 via DuckDB
+    con = connect_duckdb()
+    con.execute(
+        f"""
+        CREATE OR REPLACE TABLE bdnb_construction_{dep} AS
+        SELECT * FROM read_parquet('{local_parquet_1.as_posix()}');
+    """
+    )
+
+    con.execute(
+        f"COPY bdnb_construction_{dep} TO '{s3_uri_construction}' (FORMAT PARQUET);"
+    )
+
+    con.execute(
+        f"""
+        CREATE OR REPLACE TABLE bdnb_groupe_{dep} AS
+        SELECT * FROM read_parquet('{local_parquet_2.as_posix()}');
+    """
+    )
+
+    con.execute(f"COPY bdnb_groupe_{dep} TO '{s3_uri_groupe}' (FORMAT PARQUET);")
+    print(f"[OK] BDNB {dep} -> {s3_uri_construction} / {s3_uri_groupe}")
+
+    safe_rmtree(dl_dir)
+    safe_rmtree(unzip_dir)
+    safe_rmtree(out_dir)
+
+
+# -----------------------------------------------------------------------------
+# BDTOPO (IGN / geopf)
+# -----------------------------------------------------------------------------
+
+
+def find_bdtopo_7z_links(date):
+    session = get_session()
+    r = session.get(BDTOPO_DOWNLOAD_PAGE, timeout=(10, 60))
+    r.raise_for_status()
+
+    soup = BeautifulSoup(r.text, "html.parser")
 
     pattern = re.compile(
         r"BDTOPO_\d-\d_TOUSTHEMES_GPKG_LAMB93_D\d{3}_\d{4}-\d{2}-\d{2}\.7z$"
@@ -126,16 +385,15 @@ def find_bdtopo_7z_links(date):
             if href.startswith("http"):
                 url = href
             else:
-                url = requests.compat.urljoin(BDTOPO_PAGE, href)
+                url = requests.compat.urljoin(BDTOPO_DOWNLOAD_PAGE, href)
             links.add(url)
 
     return sorted(links)
 
 
-def find_bdtopo_7z_links_for_dep(date_filter: str, dep: str):
-    links = find_bdtopo_7z_links(date_filter)
+def find_bdtopo_7z_links_for_dep(bdtopo_links: dict[str, str], dep: str):
     dep_tag = f"_D{int(dep):03d}_"  # ex: D092
-    return [url for url in links if dep_tag in url]
+    return [url for url in bdtopo_links if dep_tag in url]
 
 
 def unzip_bdtopo_archive(archive_path: Path, target_root: Path):
@@ -151,13 +409,16 @@ def unzip_bdtopo_archive(archive_path: Path, target_root: Path):
     return target_dir
 
 
-def fetch_bdtopo_for_dep(dep: str, s3_root: str):
+def fetch_bdtopo_for_dep(
+    dep: str, s3_root: str, *, bdtopo_links: dict[str, str]
+) -> None:
     dep = dep.zfill(2)
     s3_uri = f"{s3_root}/BDTOPO/{dep}/bdtopo-{dep}.parquet"
-    if check_s3_exists(s3_uri):
+    if mc_exists(s3_uri):
         print(f"[SKIP] BDTOPO {dep} existe déjà sur S3 ({s3_uri})")
         return
-    urls = find_bdtopo_7z_links_for_dep(BDTOPO_DATE_FILTER, dep)
+    urls = find_bdtopo_7z_links_for_dep(bdtopo_links, dep)
+
     if not urls:
         print(f"[WARN] Aucun lien BDTOPO trouvé pour le département {dep}")
         return
@@ -173,7 +434,8 @@ def fetch_bdtopo_for_dep(dep: str, s3_root: str):
     unzip_dir.mkdir(parents=True, exist_ok=True)
 
     fname = url.split("/")[-1]
-    archive_path = stream_download(url, dl_dir / fname)
+    with BDTOPO_SEM:
+        archive_path = stream_download(url, dl_dir / fname)
     target_dir = unzip_bdtopo_archive(archive_path, target_root=unzip_dir)
 
     # Cherche le GPKG
@@ -222,242 +484,70 @@ def fetch_bdtopo_for_dep(dep: str, s3_root: str):
     con.execute(f"COPY bdtopo_{dep} TO '{s3_uri}' (FORMAT PARQUET);")
     print(f"[OK] BDTOPO {dep} -> {s3_uri}")
 
-    # Nettoyage local pour ce dép
-    shutil.rmtree(DATA_RAW, ignore_errors=True)
+    safe_rmtree(dl_dir)
+    safe_rmtree(unzip_dir)
+    safe_rmtree(out_dir)
 
 
-# ---------------------------------------------------------------------
-# BAN
-# ---------------------------------------------------------------------
-def fetch_ban_dep_to_s3(dep: str, s3_root: str):
-    dep = dep.zfill(2)
-    url = f"{BAN_BASE}/adresses-{dep}.csv.gz"
-    s3_uri = f"{s3_root}/BAN/{dep}/adresses-{dep}.parquet"
-    if check_s3_exists(s3_uri):
-        print(f"[SKIP] BAN {dep} existe déjà sur S3 ({s3_uri})")
-        return
-    con = connect_duckdb()
-    con.execute(
-        f"""
-        CREATE OR REPLACE TABLE ban_{dep} AS
-        SELECT * FROM read_csv_auto(
-            '{url}',
-            delim=';',
-            header=True
-        );
-    """
-    )
-    con.execute(f"COPY ban_{dep} TO '{s3_uri}' (FORMAT PARQUET);")
-    print(f"[OK] BAN {dep} -> {s3_uri}")
+# -----------------------------------------------------------------------------
+# Orchestration
+# -----------------------------------------------------------------------------
 
 
-# ---------------------------------------------------------------------
-# CADASTRE
-# ---------------------------------------------------------------------
-def fetch_cadastre_dep_to_s3(dep: str, s3_root: str):
-    dep = dep.zfill(2)
-
-    url = f"{CADASTRE_BASE}/{dep}/cadastre-{dep}-parcelles.json.gz"
-
-    print(f"[INFO] Téléchargement Cadastre {dep}")
-    base_dir = DATA_RAW / "CADASTRE" / dep
-    base_dir.mkdir(parents=True, exist_ok=True)
-
-    # 1. Télécharger le .json.gz
-    gz_path = base_dir / f"cadastre-{dep}-parcelles.json.gz"
-    json_path = base_dir / f"cadastre-{dep}-parcelles.json"
-    parquet_path = base_dir / f"cadastre-{dep}-parcelles.parquet"
-
-    # stream_download est ta fonction existante
-    stream_download(url, gz_path)
-
-    # 2. Décompression .gz → .geojson
-    print(" → Décompression du GeoJSON.gz")
-    with gzip.open(gz_path, "rb") as f_in, open(json_path, "wb") as f_out:
-        shutil.copyfileobj(f_in, f_out)
-
-    # 3. Lecture avec GeoPandas
-    print(" → Lecture du GeoJSON avec GeoPandas")
-    gdf = gpd.read_file(json_path)
-    gdf = gdf.to_crs("EPSG:2154")  # ou TARGET_CRS si tu préfères centraliser
-
-    # 4. Écriture GeoParquet local
-    print(" → Écriture GeoParquet local")
-    gdf.to_parquet(parquet_path)
-
-    # 5. Envoi vers S3 via DuckDB
-    con = connect_duckdb()
-    s3_uri = f"{s3_root}/CADASTRE/{dep}/cadastre-{dep}-parcelles.parquet"
-    con.execute(
-        f"""
-        CREATE OR REPLACE TABLE cadastre_{dep} AS
-        SELECT * FROM read_parquet('{parquet_path.as_posix()}');
-    """
-    )
-    con.execute(f"COPY cadastre_{dep} TO '{s3_uri}' (FORMAT PARQUET);")
-    print(f"[OK] Cadastre {dep} → {s3_uri}")
-    shutil.rmtree(DATA_RAW, ignore_errors=True)
-
-
-# ---------------------------------------------------------------------
-# RNB
-# ---------------------------------------------------------------------
-
-
-def fetch_rnb_dep_to_s3(dep, s3_root):
-    dep = dep.zfill(2)
-    url = f"https://rnb-opendata.s3.fr-par.scw.cloud/files/RNB_{dep}.csv.zip"
-    s3_uri = f"{s3_root}/RNB/{dep}/RNB_{dep}.parquet"
-    if check_s3_exists(s3_uri):
-        print(f"[SKIP] RNB {dep} existe déjà sur S3 ({s3_uri})")
-        return
-    # Télécharger et dézipper en mémoire
-    resp = requests.get(url)
-    resp.raise_for_status()
-    z = zipfile.ZipFile(io.BytesIO(resp.content))
-    csv_name = z.namelist()[0]
-    csv_bytes = z.read(csv_name)
-
-    # On le recomprime en gzip dans un tempfile
-    with tempfile.NamedTemporaryFile(suffix=".csv.gz", delete=True) as tmp:
-        with gzip.open(tmp.name, "wb") as gz:
-            gz.write(csv_bytes)
-
-        con = connect_duckdb()
-        con.execute(
-            f"""
-            CREATE OR REPLACE TABLE rnb_{dep} AS
-            SELECT * FROM read_csv_auto('{tmp.name}', delim=';', header=True);
-        """
-        )
-
-        con.execute(f"COPY rnb_{dep} TO '{s3_uri}' (FORMAT PARQUET);")
-
-    print(f"[OK] RNB {dep} -> {s3_uri}")
-
-
-# ---------------------------------------------------------------------
-# BDNB (TODO selon format réel)
-# ---------------------------------------------------------------------
-
-
-def fetch_bdnb_dep_to_s3(dep: str, s3_root: str):
-
-    dep = dep.zfill(2)
-
-    url = f"https://open-data.s3.fr-par.scw.cloud/bdnb_millesime_2025-07-a/millesime_2025-07-a_dep{dep}/open_data_millesime_2025-07-a_dep{dep}_gpkg.zip"
-    s3_uri_construction = f"{s3_root}/BDNB/{dep}/bdnb-construction-{dep}.parquet"
-    s3_uri_groupe = f"{s3_root}/BDNB/{dep}/bdnb-groupe-{dep}.parquet"
-    if check_s3_exists(s3_uri_construction) and check_s3_exists(s3_uri_groupe):
-        print(f"[SKIP] BDNB {dep} existe déjà sur S3 ({s3_uri_construction})")
-        return
-    dl_dir = DATA_RAW / "BDNB" / "downloads" / dep
-    unzip_dir = DATA_RAW / "BDNB" / "unzipped" / dep
-    out_dir = DATA_RAW / "BDNB" / dep
-    for d in [dl_dir, unzip_dir, out_dir]:
-        d.mkdir(parents=True, exist_ok=True)
-
-    fname = url.split("/")[-1]
-    local_zip = dl_dir / fname
-    stream_download(url, local_zip)
-
-    # Unzip local
-    with zipfile.ZipFile(local_zip, "r") as z:
-        z.extractall(unzip_dir)
-
-    # Chercher le .gpkg
-    gpkg_files = []
-    for dirpath, dirnames, filenames in os.walk(unzip_dir):
-        for fn in filenames:
-            if fn.endswith(".gpkg") and "bdnb" in fn:
-                gpkg_files.append(os.path.join(dirpath, fn))
-
-    if not gpkg_files:
-        raise RuntimeError(f"Aucun fichier GPKG trouvé dans BDNB {dep}")
-    if len(gpkg_files) > 1:
-        print(
-            f"[WARN] Plusieurs fichiers GPKG trouvés pour BDNB {dep}, on prend le premier."
-        )
-
-    gpkg_path = gpkg_files[0]
-
-    # Lecture GeoPandas
-    gdf_construction = gpd.read_file(gpkg_path, layer="batiment_construction")[
-        ["batiment_construction_id", "batiment_groupe_id"]
-    ]
-    gdf_groupe_compile = gpd.read_file(gpkg_path, layer="batiment_groupe_compile")
-
-    # gdf_construction = gdf_construction.to_crs(TARGET_CRS)
-    # gdf_groupe_compile = gdf_groupe_compile.to_crs(TARGET_CRS)
-
-    # Écrire temporairement en parquet local
-    local_parquet_1 = out_dir / f"bdnb-construction-{dep}.parquet"
-    gdf_construction.to_parquet(local_parquet_1)
-    local_parquet_2 = out_dir / f"bdnb-groupe-{dep}.parquet"
-    gdf_groupe_compile.to_parquet(local_parquet_2)
-
-    # Envoyer vers S3 via DuckDB
-    con = connect_duckdb()
-    con.execute(
-        f"""
-        CREATE OR REPLACE TABLE bdnb_construction_{dep} AS
-        SELECT * FROM read_parquet('{local_parquet_1.as_posix()}');
-    """
-    )
-
-    con.execute(
-        f"COPY bdnb_construction_{dep} TO '{s3_uri_construction}' (FORMAT PARQUET);"
-    )
-
-    con.execute(
-        f"""
-        CREATE OR REPLACE TABLE bdnb_groupe_{dep} AS
-        SELECT * FROM read_parquet('{local_parquet_2.as_posix()}');
-    """
-    )
-
-    con.execute(f"COPY bdnb_groupe_{dep} TO '{s3_uri_groupe}' (FORMAT PARQUET);")
-    print(f"[OK] BDNB {dep} -> {s3_uri_construction} / {s3_uri_groupe}")
-
-    # Nettoyer
-    shutil.rmtree(DATA_RAW, ignore_errors=True)
-
-
-# ---------------------------------------------------------------------
-# MAIN
-# ---------------------------------------------------------------------
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--deps", nargs="+")
-    p.add_argument(
-        "--s3-root",
-        required=True,
-        help="Préfixe S3 commun, ex: s3://bhurpeau/WP2/raw",
-    )
+    p.add_argument("--s3-root", required=True, help="ex: s3/bhurpeau/graphe/villes")
+    p.add_argument("--deps", nargs="*", default=None, help="liste deps (sinon France)")
+    p.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
+
     p.add_argument("--no-ban", action="store_true")
     p.add_argument("--no-cadastre", action="store_true")
     p.add_argument("--no-rnb", action="store_true")
-    p.add_argument("--no-bdnb", action="store_true")
     p.add_argument("--no-bdtopo", action="store_true")
+    p.add_argument("--no-bdnb", action="store_true")
+
     return p.parse_args()
+
+
+def fetch_one_dep(dep: str, args, bdtopo_links: Optional[dict[str, str]]) -> None:
+    print(f"\n=== Département {dep} ===")
+
+    if not args.no_ban:
+        fetch_ban_dep_to_s3(dep, args.s3_root)
+
+    if not args.no_cadastre:
+        fetch_cadastre_dep_to_s3(dep, args.s3_root)
+
+    if not args.no_rnb:
+        fetch_rnb_dep_to_s3(dep, args.s3_root)
+
+    if not args.no_bdtopo and bdtopo_links is not None:
+        fetch_bdtopo_for_dep(dep, args.s3_root, bdtopo_links=bdtopo_links)
+
+    if not args.no_bdnb:
+        fetch_bdnb_dep_to_s3(dep, args.s3_root)
 
 
 def main():
     args = parse_args()
-    if not args.deps:
-        args.deps = DEP_FRANCE
-    for dep in args.deps:
-        print(f"\n=== Département {dep} ===")
-        if not args.no_ban:
-            fetch_ban_dep_to_s3(dep, args.s3_root)
-        if not args.no_cadastre:
-            fetch_cadastre_dep_to_s3(dep, args.s3_root)
-        if not args.no_rnb:
-            fetch_rnb_dep_to_s3(dep, args.s3_root)
-        if not args.no_bdtopo:
-            fetch_bdtopo_for_dep(dep, args.s3_root)
-        if not args.no_bdnb:
-            fetch_bdnb_dep_to_s3(dep, args.s3_root)
+    deps = args.deps or DEP_FRANCE
+
+    # Scrape BDTOPO une fois
+    bdtopo_links = None
+    if not args.no_bdtopo:
+        bdtopo_links = find_bdtopo_7z_links(BDTOPO_DATE_FILTER)
+
+    print(
+        f"[FETCH] deps={len(deps)} workers={args.workers} bdtopo_concurrency={BDTOPO_SEM._value}"
+    )
+
+    # Parallélisation par dep
+    with ThreadPoolExecutor(max_workers=args.workers) as ex:
+        futs = [ex.submit(fetch_one_dep, dep, args, bdtopo_links) for dep in deps]
+        for fut in as_completed(futs):
+            fut.result()  # remonte les exceptions immédiatement
+
+    print("[FETCH] done")
 
 
 if __name__ == "__main__":

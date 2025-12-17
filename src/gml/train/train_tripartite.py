@@ -3,7 +3,8 @@
 
 import torch
 from typing import Optional
-from gml.train.utils import maybe_pick_scalar_weight
+from gml.train.utils import maybe_pick_scalar_weight, scheduled_value, prune_columns
+
 # -------------------------------------------------------------------
 # Entraînement DMoN-3p avec annealing, pruning différé et Optuna (optionnel)
 # -------------------------------------------------------------------
@@ -187,7 +188,7 @@ def train_dmon3p_multidep(
     heads,
     optimizer,
     loader,
-    make_criterion_fn,   # callable(data)->criterion (DMoN3P)
+    make_criterion_fn,  # callable(data)->criterion (DMoN3P)
     XY_KEY,
     YZ_KEY,
     epochs: int,
@@ -214,16 +215,18 @@ def train_dmon3p_multidep(
         gamma_t = scheduled_value(g0, gmax, gstep, e, epochs, delay=anneal_delay_epoch)
 
         for batch in loader:
-            data = batch[0] if isinstance(batch, (list, tuple)) else batch
 
+            data = batch["data"]
             # edges pour la loss
             edge_index_XY = data[XY_KEY].edge_index
             edge_index_YZ = data[YZ_KEY].edge_index
 
             w_XY = maybe_pick_scalar_weight(getattr(data[XY_KEY], "edge_attr", None))
             w_YZ = maybe_pick_scalar_weight(getattr(data[YZ_KEY], "edge_attr", None))
-            if w_XY is not None: w_XY = w_XY.to(device)
-            if w_YZ is not None: w_YZ = w_YZ.to(device)
+            if w_XY is not None:
+                w_XY = w_XY.to(device)
+            if w_YZ is not None:
+                w_YZ = w_YZ.to(device)
 
             # criterion dépend des tailles
             criterion = make_criterion_fn(data).to(device)
@@ -243,8 +246,8 @@ def train_dmon3p_multidep(
                 device=device,
                 lam_g=lam_g,
                 clip_grad=clip_grad,
-                schedule_beta=(beta_t, beta_t, bstep),   # figé à beta_t
-                schedule_gamma=(gamma_t, gamma_t, gstep),# figé à gamma_t
+                schedule_beta=(beta_t, beta_t, bstep),
+                schedule_gamma=(gamma_t, gamma_t, gstep),
                 anneal_delay_epoch=anneal_delay_epoch,
                 prune_every=prune_every,
                 min_usage=min_usage,
@@ -254,4 +257,3 @@ def train_dmon3p_multidep(
                 use_amp=use_amp,
                 trial=trial,
             )
-

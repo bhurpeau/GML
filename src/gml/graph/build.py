@@ -16,7 +16,14 @@ from torch_geometric.nn import knn_graph
 
 
 def build_graph_from_golden_datasets(
-    gdf_bat, gdf_par, gdf_ban, df_ban_links, df_par_links
+    gdf_bat,
+    gdf_par,
+    gdf_ban,
+    df_ban_links,
+    df_par_links,
+    *,
+    building_schema: list[str] | None = None,
+    parcel_schema: list[str] | None = None,
 ):
     def _norm(s):
         return s.astype(str).str.strip()
@@ -35,7 +42,9 @@ def build_graph_from_golden_datasets(
     df_ban_links[link_ban_col] = _norm(df_ban_links[link_ban_col])
     df_ban_links[link_rnb_col] = _norm(df_ban_links[link_rnb_col])
 
-    par_x = prepare_parcel_features(gdf_par)
+    par_x, parcel_schema, _, _ = prepare_parcel_features(
+        gdf_par, parcel_schema=parcel_schema
+    )
     bat_index = (
         gdf_bat[["rnb_id"]]
         .drop_duplicates()
@@ -44,7 +53,9 @@ def build_graph_from_golden_datasets(
         .rename(columns={"index": "b"})
     )
     bat_map = pd.Series(bat_index["b"].values, index=bat_index["rnb_id"])
-    bat_x = prepare_building_features(gdf_bat)
+    bat_x, building_schema, _, _ = prepare_building_features(
+        gdf_bat, building_schema=building_schema
+    )
 
     # Adresses
     gdf_ban_u = gdf_ban.drop_duplicates(subset="ban_id").copy()
@@ -83,7 +94,9 @@ def build_graph_from_golden_datasets(
     ).unsqueeze(1)
 
     # Adresse-Bâtiment
-    ab = df_ban_links.rename(columns={link_ban_col: "ban_id", link_rnb_col: "rnb_id"})[["ban_id", "rnb_id"]].dropna()
+    ab = df_ban_links.rename(columns={link_ban_col: "ban_id", link_rnb_col: "rnb_id"})[
+        ["ban_id", "rnb_id"]
+    ].dropna()
     ab = ab.merge(ban_index, on="ban_id", how="inner")
     ab = ab.merge(bat_index, on="rnb_id", how="inner")
 
@@ -129,4 +142,4 @@ def build_graph_from_golden_datasets(
     data["adresse", "localise", "bâtiment"].edge_index = edge_ab
     data["bâtiment", "localise_par", "adresse"].edge_index = edge_ab.flip(0)
 
-    return data, bat_map
+    return data, bat_map, building_schema, parcel_schema

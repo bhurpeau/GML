@@ -8,6 +8,7 @@ import torch_geometric.utils as pyg_utils
 
 
 def build_parcel_adjacency(gdf_par: gpd.GeoDataFrame) -> (torch.Tensor, torch.Tensor):
+    gdf_par.geometry = gdf_par.geometry.make_valid()
     sjoin = gpd.sjoin(gdf_par, gdf_par, predicate="touches", how="inner")
 
     sjoin = sjoin[sjoin.index != sjoin["index_right"]]

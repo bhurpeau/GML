@@ -1,9 +1,8 @@
 import duckdb
 import os
-import pandas as pd
+import subprocess
 import geopandas as gpd
-
-TARGET_CRS = "EPSG:2154"
+from gml.config import TARGET_CRS
 
 
 def connect_duckdb():
@@ -51,3 +50,8 @@ def read_parquet_s3_as_gdf(
         crs=TARGET_CRS,
     )
     return gdf
+
+
+def s3_put_file(data_path: str, s3_path: str):
+    s3_path = s3_path.replace("s3://", "s3/")
+    subprocess.run(["mc", "cp", data_path, s3_path], check=True)

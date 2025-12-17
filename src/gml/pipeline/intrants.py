@@ -14,10 +14,11 @@ Pour chaque département, on produit en LOCAL :
 """
 
 import json
-from pathlib import Path
 import pandas as pd
 import geopandas as gpd
 import shutil
+import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from gml.data.intrants import parse_rnb_links, perform_semantic_sjoin
 from gml.io.duckdb_s3 import (
     connect_duckdb,
@@ -25,13 +26,11 @@ from gml.io.duckdb_s3 import (
     read_parquet_s3_as_gdf,
 )
 from gml.io.paths import DATA_INTRANTS
-from gml.config import TARGET_CRS
-
+from gml.config import TARGET_CRS, DEP_FRANCE, DEFAULT_WORKERS
 # ---------------------------------------------------------------------
 # CONFIG LOCALE
 # ---------------------------------------------------------------------
 
-PLU_PATH = "/home/onyxia/work/GML/data/wfs_du.gpkg"  # à adapter si besoin
 DATA_INTRANTS.mkdir(parents=True, exist_ok=True)
 
 
@@ -61,7 +60,7 @@ def create_intrants_for_dep(dep: str, s3_root: str):
     s3_bdnb_group = f"{s3_root}/BDNB/{dep}/bdnb-groupe-{dep}.parquet"
     s3_parcelles = f"{s3_root}/CADASTRE/{dep}/cadastre-{dep}-parcelles.parquet"
     s3_ban = f"{s3_root}/BAN/{dep}/adresses-{dep}.parquet"
-
+    s3_plu = f"{s3_root.replace("/raw", "/intrants")}/zone_urba.parquet"
     out_dir = DATA_INTRANTS / dep
     out_dir.mkdir(parents=True, exist_ok=True)
     # ------------------------------------------------------------------
@@ -126,7 +125,7 @@ def create_intrants_for_dep(dep: str, s3_root: str):
     if "id" in gdf_parcelles.columns and "parcelle_id" not in gdf_parcelles.columns:
         gdf_parcelles.rename(columns={"id": "parcelle_id"}, inplace=True)
 
-    doc_urba = gpd.read_file(PLU_PATH, layer="zone_urba")
+    doc_urba = read_parquet_s3_as_gdf(s3_plu)
     gdf_parcelles = perform_semantic_sjoin(gdf_parcelles, doc_urba)
 
     gdf_parcelles["LIBELLE"] = gdf_parcelles["LIBELLE"].fillna("HP").str[:2]
@@ -205,24 +204,32 @@ def create_intrants_for_dep(dep: str, s3_root: str):
     shutil.rmtree(out_dir, ignore_errors=True)
 
 
-if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument(
         "--deps",
         type=str,
         nargs="+",
-        required=True,
         help="Liste des départements à traiter (ex: --deps 92 75 33)",
     )
-    parser.add_argument(
+    p.add_argument(
         "--s3-root",
         type=str,
         required=True,
         help="Racine S3 des données brutes, ex: s3://bhurpeau/WP2/raw",
     )
-    args = parser.parse_args()
+    p.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
+    return p.parse_args()
 
-    for dep in args.deps:
-        create_intrants_for_dep(dep, args.s3_root)
+
+def main():
+    args = parse_args()
+    deps = args.deps or DEP_FRANCE
+    with ThreadPoolExecutor(max_workers=args.workers) as ex:
+        futs = [ex.submit(create_intrants_for_dep, dep, args.s3_root) for dep in deps]
+        for fut in as_completed(futs):
+            fut.result()
+
+
+if __name__ == "__main__":
+    main()

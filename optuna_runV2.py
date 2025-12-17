@@ -14,6 +14,7 @@ from gml.model.heads import TripletHeads
 from gml.model.hetero import HeteroGNN
 from gml.model.utils import XY_KEY, YZ_KEY
 
+
 def load_graph(dep: str, graphs_root: str, device: str):
     path = os.path.join(graphs_root, dep.zfill(2), "graph.pt")
     data = torch.load(path, map_location=device)

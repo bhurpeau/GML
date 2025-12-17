@@ -1,3 +1,6 @@
+import os
+
+DEFAULT_WORKERS = int(os.environ.get("GML_FETCH_WORKERS", "6"))
 TARGET_CRS = "EPSG:2154"
 K_DENSITY = 16
 K_SPATIAL = 8

@@ -17,11 +17,35 @@ from gml.io.duckdb_s3 import (
 )
 from gml.io.paths import DATA_GRAPHS
 from gml.config import TARGET_CRS
+import tempfile
+import subprocess
 
 
 # -----------------------------------------------------------------------------
 # 2. Construction du graphe pour un département
 # -----------------------------------------------------------------------------
+def _to_mc(s3_uri: str) -> str:
+    return s3_uri.replace("s3://", "s3/")
+
+
+def load_schema(s3_schemas_root: str, fname: str) -> list[str] | None:
+    s3_uri = f"{s3_schemas_root.rstrip('/')}/{fname}"
+    with tempfile.TemporaryDirectory() as td:
+        local = Path(td) / fname
+        r = subprocess.run(["mc", "cp", _to_mc(s3_uri), str(local)], check=False)
+        if r.returncode != 0 or not local.exists():
+            return None
+        return json.loads(local.read_text(encoding="utf-8"))
+
+
+def save_schema(s3_schemas_root: str, fname: str, schema: list[str]) -> None:
+    s3_uri = f"{s3_schemas_root.rstrip('/')}/{fname}"
+    with tempfile.TemporaryDirectory() as td:
+        local = Path(td) / fname
+        local.write_text(
+            json.dumps(schema, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        subprocess.run(["mc", "cp", str(local), _to_mc(s3_uri)], check=True)
 
 
 def build_graph_for_dep(dep: str, s3_intrants_root: str, out_root: Path):
@@ -52,15 +76,33 @@ def build_graph_for_dep(dep: str, s3_intrants_root: str, out_root: Path):
 
     print("→ Lecture liens Parcelles–Bâtiments (intrants S3)")
     df_parcelle_links = read_parquet_s3_as_df(con, s3_parcelle_links)
+    # Racine schémas : s3://.../intrants  ->  s3://.../schemas
+    if "/intrants" in s3_intrants_root:
+        s3_schemas_root = s3_intrants_root.replace("/intrants", "/schemas")
+    else:
+        s3_schemas_root = s3_intrants_root.rstrip("/") + "/schemas"
+
+    building_schema = load_schema(s3_schemas_root, "building_schema.json")
+    parcel_schema = load_schema(s3_schemas_root, "parcelle_schema.json")
 
     # Construction du graphe hétérogène tripartite
-    data, bat_map = build_graph_from_golden_datasets(
-        gdf_bat=gdf_bat,
-        gdf_par=gdf_par,
-        gdf_ban=gdf_ban,
-        df_ban_links=df_ban_links,
-        df_par_links=df_parcelle_links,
+    data, bat_map, building_schema_out, parcel_schema_out = (
+        build_graph_from_golden_datasets(
+            gdf_bat=gdf_bat,
+            gdf_par=gdf_par,
+            gdf_ban=gdf_ban,
+            df_ban_links=df_ban_links,
+            df_par_links=df_parcelle_links,
+            building_schema=building_schema,
+            parcel_schema=parcel_schema,
+        )
     )
+
+    # Si premier passage (schémas absents), on les écrit sur S3
+    if building_schema is None:
+        save_schema(s3_schemas_root, "building_schema.json", building_schema_out)
+    if parcel_schema is None:
+        save_schema(s3_schemas_root, "parcelle_schema.json", parcel_schema_out)
 
     # -----------------------------------------------------------------------------
     # Sauvegarde locale (graph package)
@@ -88,6 +130,17 @@ def build_graph_for_dep(dep: str, s3_intrants_root: str, out_root: Path):
         "n_adresse": int(data["adresse"].num_nodes),
         "edge_types": list(data.edge_types),
     }
+
+    def nonzero_rate(x):
+        # % de colonnes qui ont au moins une valeur non nulle
+        return float((x.abs().sum(dim=0) > 0).float().mean().item())
+
+    meta["schema_utilization"] = {
+        "adresse": nonzero_rate(data["adresse"].x),
+        "bâtiment": nonzero_rate(data["bâtiment"].x),
+        "parcelle": nonzero_rate(data["parcelle"].x),
+    }
+
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
@@ -107,8 +160,6 @@ def build_graph_for_dep(dep: str, s3_intrants_root: str, out_root: Path):
     for fname, local_path in files_to_push.items():
         s3_uri = f"{s3_graphs_root}/{dep}/{fname}"
         print(s3_uri)
-        import subprocess
-
         subprocess.run(["mc", "cp", str(local_path), s3_uri], check=True)
     print(f"[OK] Graphe construit et sauvegardé pour {dep} → {out_dir}")
     shutil.rmtree(out_dir, ignore_errors=True)

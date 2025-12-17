@@ -9,6 +9,7 @@ import torch
 import pandas as pd
 import numpy as np
 from torch.utils.data import DataLoader
+
 # === Modules prétraitements ===
 from gml.train.utils import load_best_params_from_optuna, maybe_pick_scalar_weight
 from gml.model.hetero import HeteroGNN
@@ -123,7 +124,7 @@ def main():
         num_layers=2,
         metadata=metadata,
         node_feature_sizes=node_feature_sizes,
-        edge_feature_size=2, #à regarder
+        edge_feature_size=2,  # à regarder
     ).to(device)
 
     heads = TripletHeads(dim=args.emb_dim, L=args.L, M=args.M, N=args.N).to(device)
