@@ -27,6 +27,7 @@ from gml.io.duckdb_s3 import (
 )
 from gml.io.paths import DATA_INTRANTS
 from gml.config import TARGET_CRS, DEP_FRANCE, DEFAULT_WORKERS
+
 # ---------------------------------------------------------------------
 # CONFIG LOCALE
 # ---------------------------------------------------------------------
@@ -34,7 +35,7 @@ from gml.config import TARGET_CRS, DEP_FRANCE, DEFAULT_WORKERS
 DATA_INTRANTS.mkdir(parents=True, exist_ok=True)
 
 
-def create_intrants_for_dep(dep: str, s3_root: str):
+def create_intrants_for_dep(dep: str, doc_urba: gpd.GeoDataFrame, s3_root: str):
     """
     Construit les Golden Datasets pour un département donné en lisant TOUT sur S3.
 
@@ -60,7 +61,6 @@ def create_intrants_for_dep(dep: str, s3_root: str):
     s3_bdnb_group = f"{s3_root}/BDNB/{dep}/bdnb-groupe-{dep}.parquet"
     s3_parcelles = f"{s3_root}/CADASTRE/{dep}/cadastre-{dep}-parcelles.parquet"
     s3_ban = f"{s3_root}/BAN/{dep}/adresses-{dep}.parquet"
-    s3_plu = f"{s3_root.replace("/raw", "/intrants")}/zone_urba.parquet"
     out_dir = DATA_INTRANTS / dep
     out_dir.mkdir(parents=True, exist_ok=True)
     # ------------------------------------------------------------------
@@ -124,8 +124,6 @@ def create_intrants_for_dep(dep: str, s3_root: str):
 
     if "id" in gdf_parcelles.columns and "parcelle_id" not in gdf_parcelles.columns:
         gdf_parcelles.rename(columns={"id": "parcelle_id"}, inplace=True)
-
-    doc_urba = read_parquet_s3_as_gdf(s3_plu)
     gdf_parcelles = perform_semantic_sjoin(gdf_parcelles, doc_urba)
 
     gdf_parcelles["LIBELLE"] = gdf_parcelles["LIBELLE"].fillna("HP").str[:2]
@@ -225,8 +223,13 @@ def parse_args():
 def main():
     args = parse_args()
     deps = args.deps or DEP_FRANCE
+    s3_plu = f"{args.s3_root.replace("/raw", "/intrants")}/zone_urba.parquet"
+    doc_urba = read_parquet_s3_as_gdf(connect_duckdb(), s3_plu)
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
-        futs = [ex.submit(create_intrants_for_dep, dep, args.s3_root) for dep in deps]
+        futs = [
+            ex.submit(create_intrants_for_dep, dep, doc_urba, args.s3_root)
+            for dep in deps
+        ]
         for fut in as_completed(futs):
             fut.result()
 

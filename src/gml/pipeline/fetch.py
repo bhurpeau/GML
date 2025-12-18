@@ -25,17 +25,21 @@ import io
 import gzip
 import tempfile
 import geopandas as gpd
+import boto3
+from botocore.exceptions import ClientError
+from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from threading import Semaphore
 from typing import Optional
 from gml.io.paths import DATA_RAW
 from gml.config import TARGET_CRS, DEP_FRANCE, DEFAULT_WORKERS
-from gml.io.duckdb_s3 import connect_duckdb
+from gml.io.duckdb_s3 import connect_duckdb, s3_put_file
 import requests
 from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from shapely.ops import unary_union
 
 
 # -----------------------------------------------------------------------------
@@ -70,22 +74,31 @@ def s3_path(root: str, *parts: str) -> str:
     return "/".join([root, *parts])
 
 
-def mc_cp_to_s3(local_path: Path, s3_uri: str) -> None:
-    # attend un s3_uri du style "s3/<bucket>/.../file"
-    run(["mc", "cp", str(local_path), s3_uri])
-
-
 def mc_cp_from_s3(s3_uri: str, local_path: Path) -> None:
     local_path.parent.mkdir(parents=True, exist_ok=True)
     run(["mc", "cp", s3_uri, str(local_path)])
 
 
 def mc_exists(s3_uri: str) -> bool:
-    # "mc stat" renvoie code != 0 si absent
-    p = subprocess.run(
-        ["mc", "stat", s3_uri], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    """Vérifie si un fichier existe sur S3 sans le télécharger (HEAD request)."""
+    parsed = urlparse(s3_uri)
+    bucket = parsed.netloc
+    key = parsed.path.lstrip("/")
+
+    s3 = boto3.client(
+        "s3",
+        endpoint_url="https://" + os.environ.get("AWS_S3_ENDPOINT"),
+        aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
+        aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
+        aws_session_token=os.environ.get("AWS_SESSION_TOKEN"),
+        region_name=os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
     )
-    return p.returncode == 0
+
+    try:
+        s3.head_object(Bucket=bucket, Key=key)
+        return True
+    except ClientError:
+        return False
 
 
 def get_session() -> requests.Session:
@@ -154,6 +167,18 @@ def safe_rmtree(path: Path) -> None:
         shutil.rmtree(path, ignore_errors=True)
     except Exception:
         pass
+
+
+def drop_tiny_parts(multipoly, min_area_m2=1_000):
+    if multipoly.geom_type == "Polygon":
+        return multipoly
+    if multipoly.geom_type != "MultiPolygon":
+        return multipoly
+
+    parts = [p for p in multipoly.geoms if p.area >= min_area_m2]
+    if not parts:
+        raise RuntimeError("Boundary vide après filtrage (min_area trop grand).")
+    return unary_union(parts)
 
 
 # -----------------------------------------------------------------------------
@@ -280,7 +305,7 @@ def fetch_rnb_dep_to_s3(dep: str, s3_root: str) -> None:
 
 def fetch_bdnb_dep_to_s3(dep: str, s3_root: str) -> None:
     dep = dep.zfill(2)
-    url = f"https://open-data.s3.fr-par.scw.cloud/bdnb_millesime_2025-07-a/millesime_2025-07-a_dep{dep}/open_data_millesime_2025-07-a_dep{dep}_gpkg.zip"
+    url = f"https://open-data.s3.fr-par.scw.cloud/bdnb_millesime_2025-07-a/millesime_2025-07-a_dep{dep.lower()}/open_data_millesime_2025-07-a_dep{dep.lower()}_gpkg.zip"
     s3_uri_construction = f"{s3_root}/BDNB/{dep}/bdnb-construction-{dep}.parquet"
     s3_uri_groupe = f"{s3_root}/BDNB/{dep}/bdnb-groupe-{dep}.parquet"
     if mc_exists(s3_uri_construction) and mc_exists(s3_uri_groupe):
@@ -328,27 +353,8 @@ def fetch_bdnb_dep_to_s3(dep: str, s3_root: str) -> None:
     local_parquet_2 = out_dir / f"bdnb-groupe-{dep}.parquet"
     gdf_groupe_compile.to_parquet(local_parquet_2)
 
-    # Envoyer vers S3 via DuckDB
-    con = connect_duckdb()
-    con.execute(
-        f"""
-        CREATE OR REPLACE TABLE bdnb_construction_{dep} AS
-        SELECT * FROM read_parquet('{local_parquet_1.as_posix()}');
-    """
-    )
-
-    con.execute(
-        f"COPY bdnb_construction_{dep} TO '{s3_uri_construction}' (FORMAT PARQUET);"
-    )
-
-    con.execute(
-        f"""
-        CREATE OR REPLACE TABLE bdnb_groupe_{dep} AS
-        SELECT * FROM read_parquet('{local_parquet_2.as_posix()}');
-    """
-    )
-
-    con.execute(f"COPY bdnb_groupe_{dep} TO '{s3_uri_groupe}' (FORMAT PARQUET);")
+    s3_put_file(local_parquet_1, s3_uri_construction)
+    s3_put_file(local_parquet_2, s3_uri_groupe)
     print(f"[OK] BDNB {dep} -> {s3_uri_construction} / {s3_uri_groupe}")
 
     safe_rmtree(dl_dir)
@@ -369,7 +375,9 @@ def find_bdtopo_7z_links(date):
     soup = BeautifulSoup(r.text, "html.parser")
 
     pattern = re.compile(
-        r"BDTOPO_\d-\d_TOUSTHEMES_GPKG_LAMB93_D\d{3}_\d{4}-\d{2}-\d{2}\.7z$"
+        r"BDTOPO_\d-\d_TOUSTHEMES_GPKG_LAMB93_"
+        r"D(?:\d{3}|02A|02B)_"
+        r"\d{4}-\d{2}-\d{2}\.7z$"
     )
 
     links = set()
@@ -392,8 +400,20 @@ def find_bdtopo_7z_links(date):
 
 
 def find_bdtopo_7z_links_for_dep(bdtopo_links: dict[str, str], dep: str):
-    dep_tag = f"_D{int(dep):03d}_"  # ex: D092
-    return [url for url in bdtopo_links if dep_tag in url]
+    """
+    bdtopo_links: dict dep -> url  (ou au moins dict de urls)
+    dep: '01'..'95' ou '2A'/'2B'
+    Retourne une liste d'URLs candidates
+    """
+
+    if dep in ("2A", "2B"):
+        pat = re.compile(r"_D0?2A0?2B_|_D0?2AB_|_D0?2A_|_D0?2B_")
+        return [u for u in bdtopo_links if pat.search(u)]
+
+    # cas général
+    dep_int = int(dep)
+    pat = re.compile(rf"_D{dep_int:03d}_")
+    return [u for u in bdtopo_links if pat.search(u)]
 
 
 def unzip_bdtopo_archive(archive_path: Path, target_root: Path):
@@ -455,34 +475,18 @@ def fetch_bdtopo_for_dep(
     # Lecture des couches
     gdf_boundary = gpd.read_file(gpkg_path, layer="departement")
     gdf_boundary = gdf_boundary.loc[gdf_boundary["code_insee"] == dep]
-
-    gdf_bdtopo = gpd.read_file(gpkg_path, layer="batiment")
-
-    # Projection
-    gdf_bdtopo = gdf_bdtopo.to_crs(TARGET_CRS)
     gdf_boundary = gdf_boundary.to_crs(TARGET_CRS)
-
-    # union_all à la place de unary_union
-    departement_boundary = gdf_boundary.geometry.union_all()
-
-    # On peut utiliser clip pour être propre
-    gdf_bdtopo = gpd.clip(gdf_bdtopo, departement_boundary).copy()
-
-    # On écrit en local puis on pousse vers S3 via DuckDB
+    boundary = gdf_boundary.geometry.iloc[0]
+    if dep in ["2A", "2B", "29"]:
+        boundary = drop_tiny_parts(boundary, min_area_m2=100_000)
+    gdf_bdtopo = gpd.read_file(gpkg_path, layer="batiment")
+    gdf_bdtopo = gdf_bdtopo.to_crs(TARGET_CRS)
+    gdf_bdtopo = gpd.clip(gdf_bdtopo, boundary)
     out_dir = DATA_RAW / "BDTOPO" / dep
     out_dir.mkdir(parents=True, exist_ok=True)
     local_parquet = out_dir / f"bdtopo-{dep}.parquet"
     gdf_bdtopo.to_parquet(local_parquet)
-
-    con = connect_duckdb()
-    con.execute(
-        f"""
-        CREATE OR REPLACE TABLE bdtopo_{dep} AS
-        SELECT * FROM read_parquet('{local_parquet.as_posix()}');
-    """
-    )
-    con.execute(f"COPY bdtopo_{dep} TO '{s3_uri}' (FORMAT PARQUET);")
-    print(f"[OK] BDTOPO {dep} -> {s3_uri}")
+    s3_put_file(local_parquet, s3_uri)
 
     safe_rmtree(dl_dir)
     safe_rmtree(unzip_dir)
@@ -496,7 +500,7 @@ def fetch_bdtopo_for_dep(
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--s3-root", required=True, help="ex: s3/bhurpeau/graphe/villes")
+    p.add_argument("--s3-root", required=True, help="ex: s3/bhurpeau/WP2/raw")
     p.add_argument("--deps", nargs="*", default=None, help="liste deps (sinon France)")
     p.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
 
