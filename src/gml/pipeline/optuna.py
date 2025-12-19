@@ -255,7 +255,9 @@ def main():
     )
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--trials", type=int, default=30)
-    parser.add_argument("--storage", type=str, default="sqlite:///out/optuna_polygon.db")
+    parser.add_argument(
+        "--storage", type=str, default="sqlite:///out/optuna_polygon.db"
+    )
     parser.add_argument("--study_name", type=str, default="optuna_search")
     parser.add_argument(
         "--graphs-root",
