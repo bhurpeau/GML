@@ -93,5 +93,9 @@ def read_parquet_s3_as_gdf(
 
 
 def s3_put_file(data_path: str, s3_path: str):
-    s3_path = s3_path.replace("s3://", "s3/")
+    s3_path = _mc_uri(s3_path)
     subprocess.run(["mc", "cp", data_path, s3_path], check=True)
+
+def s3_get_file(data_path: str, s3_path: str):
+    s3_path = _mc_uri(s3_path)
+    subprocess.run(["mc", "cp", s3_path, data_path], check=True)

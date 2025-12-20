@@ -7,22 +7,27 @@ import numpy as np
 import torch
 import optuna
 import traceback
-
+import tempfile
+from pathlib import Path
 from gml.train.train_tripartite import train_dmon3p
 from gml.model.dmon3p import DMoN3P
 from gml.model.heads import TripletHeads
 from gml.model.hetero import HeteroGNN
 from gml.model.utils import XY_KEY, YZ_KEY
-
+from gml.io.duckdb_s3 import s3_get_file
 
 def dep_dirname(dep: str) -> str:
     return dep.zfill(2) if dep.isdigit() else dep  # '2A','2B' inchangés
 
 
-def load_graph(dep: str, graphs_root: str, device: str):
+def load_graph(dep: str, graphs_root: str, device: str): 
     path = os.path.join(graphs_root, dep_dirname(dep), "graph.pt")
-    data = torch.load(path, map_location=device)
-    return data
+    with tempfile.TemporaryDirectory() as td:
+        local = Path(td) / "graph.pt"
+        r = s3_get_file(path, str(local))
+        if r.returncode != 0 or not local.exists():
+            return None
+        return torch.load(local, map_location=device)
 
 
 def maybe_pick_scalar_weight(edge_attr):
